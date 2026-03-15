@@ -323,11 +323,25 @@ impl Actor<anyhow::Error> for NetworkActor {
                                     .copied()
                                     .zip(self.pending_packets.remove(&ip))
                                 {
+                                    let replay_count = queue.len();
+                                    info!(
+                                        "Replaying {} buffered packets for {} via {}",
+                                        replay_count,
+                                        ip,
+                                        id
+                                    );
                                     while let Some((_, pkt)) = queue.pop_front() {
                                         let direct = self.direct.clone();
                                         tokio::spawn(async move {
+                                            let peer_state = direct.get_peer_state(id).await.ok();
                                             if let Err(e) = direct.route_packet(id, DirectMessage::IpPacket(pkt)).await {
-                                                warn!("Failed to route buffered packet to {}: {}", id, e);
+                                                warn!(
+                                                    "Failed to route buffered packet to {} for ip {} state={:?}: {}",
+                                                    id,
+                                                    ip,
+                                                    peer_state,
+                                                    e
+                                                );
                                             }
                                         });
                                     }
@@ -419,7 +433,14 @@ impl NetworkActor {
         let queue = self.pending_packets.entry(ip).or_default();
         if queue.len() >= PENDING_MAX_PER_IP {
             queue.pop_front();
+            warn!(
+                "Buffered packet queue at cap for {}. Dropping oldest packet before enqueue",
+                ip
+            );
         }
         queue.push_back((Instant::now(), pkt.clone()));
+        if queue.len() == 1 || queue.len().is_multiple_of(256) {
+            info!("Buffered packet queue for {} now has {} packets", ip, queue.len());
+        }
     }
 }

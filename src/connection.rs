@@ -3,14 +3,16 @@ use std::sync::atomic::Ordering;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
 use crate::DirectMessage;
+use crate::direct_connect::PeerState;
 use actor_helper::{Action, Actor, Handle, Receiver, act, act_ok};
 use anyhow::Result;
+use futures::StreamExt;
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{
     Endpoint, EndpointId,
     endpoint::{RecvStream, SendStream},
 };
-use n0_watcher::Watchable;
+use n0_watcher::{Stream, Watchable};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{self};
 use tracing::{debug, info, trace, warn};
@@ -70,10 +72,10 @@ struct ConnActor {
 }
 
 impl Conn {
-    #[allow(clippy::too_many_arguments)]
     pub async fn accept_connection(
         conn: iroh::endpoint::Connection,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
+        mut open_stream: Stream<n0_watcher::Direct<PeerState>>,
     ) -> Result<Self> {
         let (api, rx) = Handle::channel();
         let mut actor = ConnActor::new(
@@ -92,9 +94,21 @@ impl Conn {
         });
 
         let remote_id = conn.remote_id();
-        let connect_fut = async {
-            let (send, recv) = conn.accept_bi().await?;
-            Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+        let connect_fut = async {loop {
+                tokio::select! {
+                    conn_res = conn.accept_bi() => {
+                        let (send,recv) = conn_res?;
+                        return Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+                    }
+
+                    open_update = open_stream.next() => {
+                        if matches!(open_update, Some(PeerState::Connected(_))) {
+                            debug!("Open was faster, closing accepted connection and choosing self dialed connection");
+                            return Err(anyhow::anyhow!("open was faster"));
+                        }
+                    }
+                }
+            }
         };
 
         match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
@@ -128,6 +142,7 @@ impl Conn {
         endpoint: Endpoint,
         remote_endpoint_id: EndpointId,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
+        mut accept_stream: Stream<n0_watcher::Direct<PeerState>>,
 
     ) -> Result<Self> {
         let (api, rx) = Handle::channel();
@@ -141,9 +156,22 @@ impl Conn {
         let s = Self { api };
 
         let connect_fut = async {
-            let conn = endpoint.connect(remote_endpoint_id, crate::Direct::ALPN).await?;
-            let (send, recv) = conn.open_bi().await?;
-            Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+            loop {
+                tokio::select! {
+                    conn_res = endpoint.connect(remote_endpoint_id, crate::Direct::ALPN) => {
+                        let conn = conn_res?;
+                        let (send, recv) = conn.open_bi().await?;
+                        return Ok::<(Connection, SendStream, RecvStream), anyhow::Error>((conn, send, recv))
+                    }
+
+                    accept_update = accept_stream.next() => {
+                        if matches!(accept_update, Some(PeerState::Connected(_))) {
+                            debug!("Accept was faster, aborting dial and accepting incoming connection");
+                            return Err(anyhow::anyhow!("accept was faster"));
+                        }
+                    }
+                }
+            }
         };
 
         match tokio::time::timeout(CONNECTING_TIMEOUT, connect_fut).await {
@@ -411,6 +439,17 @@ impl ConnActor {
         }
     }
 
+    pub async fn handle_read_error(&mut self) {
+        warn!("Read loop failed");
+        self.write_tx = None;
+        if let Some(task) = self.read_task.take() {
+            task.abort();
+        }
+        if !matches!(self.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
+            self.state.set(ConnState::Disconnected).ok();
+        }
+    }
+
     pub async fn write(&mut self, pkg: DirectMessage) {
         if let Some(tx) = &self.write_tx {
             trace!("Sending packet to write task");
@@ -668,19 +707,36 @@ async fn write_loop_bounded(
         frame.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
         frame.extend_from_slice(&bytes);
 
-        match time::timeout(KEEPALIVE_INTERVAL + Duration::from_secs(2), stream.write_all(&frame)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!("Write error (frame): {}", e);
-                let _ = api.call(act_ok!(actor => actor.handle_write_error())).await;
-                break;
+        let mut retries = 0;
+        let mut offset = 0;
+        while retries < 3 {
+            let buffer = &frame[offset..];
+
+            match time::timeout(KEEPALIVE_INTERVAL + Duration::from_secs(2), stream.write(buffer)).await {
+                Ok(Ok(count)) =>  if offset + count == frame.len() {
+                    break
+                } else {
+                    offset += count;
+                }
+                Ok(Err(err)) => {
+                    warn!("Write error (frame): {}, {:?}, retrying...", err, err);
+                    retries += 1;
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    warn!("Write error timeout (frame)");
+                    api.call(act_ok!(actor => actor.handle_write_error())).await.ok();
+                    write_timeout.fetch_add(1, Ordering::SeqCst);
+                    time::sleep(Duration::from_millis(100)).await;
+                    break;
+                }
             }
-            Err(_) => {
-                warn!("Write timeout (frame) ({})", label);
-                write_timeout.fetch_add(1, Ordering::SeqCst);
-                let _ = api.call(act_ok!(actor => actor.handle_write_error())).await;
-                break;
-            }
+        }
+
+        if retries == 3 {
+            warn!("Write failed after 3 retries, dropping connection: peer_id: {}", api.call(act_ok!(actor => async move { actor.conn_endpoint_id })).await.unwrap());
+            let _ = api.call(act_ok!(actor => actor.handle_write_error())).await;
+            break;
         }
 
         tx_count.fetch_add(1, Ordering::SeqCst);
@@ -695,9 +751,11 @@ async fn retry_read_loop(
     rx_count: Arc<AtomicUsize>,
 ) {
     info!("Read task started");
-    loop {
+    let mut retries = 0;
+    while retries < 3 {
         match tokio::time::timeout(KEEPALIVE_INTERVAL + Duration::from_secs(2), read_next_msg(&mut stream)).await {
             Ok(Ok(msg)) => {
+                retries = 0;
                 rx_count.fetch_add(1, Ordering::SeqCst);
                 trace!("Read message from stream, forwarding to network actor");
                 let start = std::time::Instant::now();
@@ -714,28 +772,18 @@ async fn retry_read_loop(
             }
             Ok(Err(e)) => {
                 warn!("Stream read error: {}", e);
-                let _ = api
-                    .call(act_ok!(actor => async move { 
-                        if !matches!(actor.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
-                            actor.state.set(ConnState::Disconnected).ok();
-                        }
-                    }))
-                    .await;
-                break;
+                retries += 1;
             }
             Err(e) => {
                 warn!("Stream read error: timeout after {}", e);
-        
-                let _ = api
-                    .call(act_ok!(actor => async move { 
-                        if !matches!(actor.state.get(), ConnState::Disconnected | ConnState::ClosedAndStopped | ConnState::Closed) {
-                            actor.state.set(ConnState::Disconnected).ok();
-                        }
-                    }))
-                    .await;
-                break;
+                retries += 1;
             }
         }
+    }
+
+    if retries == 3 {
+        warn!("Read failed after 3 retries, dropping connection: peer_id: {}", api.call(act_ok!(actor => async move { actor.conn_endpoint_id })).await.unwrap());
+        let _ = api.call(act_ok!(actor => actor.handle_read_error())).await;
     }
     info!("Read task stopped");
 }

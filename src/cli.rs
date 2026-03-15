@@ -52,7 +52,8 @@ pub async fn run_cli() -> Result<()> {
             .with(fmt::layer().with_thread_ids(true))
             .with(EnvFilter::new(
                 //"iroh_lan=debug,iroh_auth=debug,iroh_topic_tracker=debug,iroh=info,iroh_gossip=debug",
-                "iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug",
+                //"iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_quinn_proto=warn,condriver-unreachable=debug",
+                "iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_quinn_proto=warn,condriver-unreachable=debug",
             ))
             .init();
     }

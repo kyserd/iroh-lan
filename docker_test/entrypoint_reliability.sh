@@ -36,6 +36,7 @@ MY_IP=""
 TUN_DEV=""
 
 tc qdisc add dev eth0 root netem delay 300ms 100ms distribution normal loss 1.5% 2.5% reorder 0.5% 5% duplicate 0.1% corrupt 0.01% rate 10mbit
+#tc qdisc replace dev eth0 root netem delay 1200ms 400ms reorder 35% 50% loss 35% 10% rate 6mbit limit 4000
 
 collect_logs() {
     local exit_code=$?

@@ -13,7 +13,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="a707fc4d9440c1599f4fb6ec8a8f4a261d22698e" }
+iroh-topic-tracker = { path = "../../code_review/iroh-topic-tracker" } #{ git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="a707fc4d9440c1599f4fb6ec8a8f4a261d22698e" }
 ed25519-dalek = "3.0.0-pre.1"
 iroh = "0.96.1"
 iroh-gossip = "0.96"
@@ -44,14 +44,13 @@ crossterm = "0.29.0"
 
 #iroh-quinn = { git = "https://github.com/n0-computer/quinn", rev = "315f491bfbdd0bb04fb8cdb43967b40bfef83d22" }
 
-[patch.crates-io]
-iroh = { git = "https://github.com/n0-computer/iroh", rev = "3a45cd0f1bd17b3b0aff81a263b6686b0eb5b837" }
-iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "3a45cd0f1bd17b3b0aff81a263b6686b0eb5b837" }
-iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "3a45cd0f1bd17b3b0aff81a263b6686b0eb5b837" }
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "c1ad5da464e0238425b29be748478d027ea0b878" }
-quinn = { git="https://github.com/rustonbsd/quinn", rev="b9fffdf0eaa4fa06875dc85473a0b6693ab5317d", package = "iroh-quinn" }
-quinn-proto = { git="https://github.com/rustonbsd/quinn", rev="b9fffdf0eaa4fa06875dc85473a0b6693ab5317d", package = "iroh-quinn-proto" }
-quinn-udp = { git="https://github.com/rustonbsd/quinn", rev="b9fffdf0eaa4fa06875dc85473a0b6693ab5317d", package = "iroh-quinn-udp" }
+#iroh = { git = "https://github.com/n0-computer/iroh", rev = "7fc9fb93e2d30badb95a87e2406f225ea73b8b48" }
+#iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "7fc9fb93e2d30badb95a87e2406f225ea73b8b48" }
+#iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "7fc9fb93e2d30badb95a87e2406f225ea73b8b48" }
+#iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "5f0e768e25e581064027188e6913891da441cd16" }
+#noq = { git="https://github.com/n0-computer/noq", rev="8adda44486fdf33f08ae7481b2c3b3a4db587548", package = "noq" }
+#noq-proto = { git="https://github.com/n0-computer/noq", rev="8adda44486fdf33f08ae7481b2c3b3a4db587548", package = "noq-proto" }
+#noq-udp = { git="https://github.com/n0-computer/noq", rev="8adda44486fdf33f08ae7481b2c3b3a4db587548", package = "noq-udp" }#
 
 [lib]
 path = "src/lib.rs"
@@ -67,3 +66,9 @@ name = "participant"
 path = "examples/participant.rs"
 crate-type = ["bin"]
 
+
+[patch.crates-io]
+iroh = { git = "https://github.com/n0-computer/iroh.git", branch = "main" }
+iroh-base = { git = "https://github.com/n0-computer/iroh.git", branch = "main" }
+irpc = { git = "https://github.com/n0-computer/irpc.git", branch = "feat-noq" }
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip.git", rev="5f0e768e25e581064027188e6913891da441cd16" }

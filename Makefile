@@ -26,6 +26,7 @@ clean-test:
 	sudo docker compose -f docker_test/compose-stress.yaml down -v
 
 reliability-test: build
+	sudo rm docker_test/results_reliability/node*/*.log -r; \
 	TOPIC="reliability_$$RANDOM"; \
 	echo "Using TOPIC=$$TOPIC"; \
 	sudo -E TOPIC=$$TOPIC RECONNECT_MAX_SEC=60 docker compose -f docker_test/compose-reliability.yaml up --build --abort-on-container-exit --remove-orphans; \

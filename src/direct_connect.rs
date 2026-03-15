@@ -1,18 +1,14 @@
 use actor_helper::{Action, Handle, act, act_ok};
 use anyhow::Result;
-use iroh::{
-    Endpoint, EndpointId,
-    endpoint::Connection,
-    protocol::ProtocolHandler,
-};
-use n0_watcher::Watchable;
+use iroh::{Endpoint, EndpointId, Watcher, endpoint::Connection, protocol::ProtocolHandler};
+use n0_watcher::{Stream, Watchable};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, hash_map::Entry};
 use tracing::{debug, error, info, trace};
 
 use crate::{ConnState, Router, RouterIp, connection::Conn, local_networking::Ipv4Pkg};
 
-const MAX_RECONNECT_ATTEMPTS: usize = 5;
+const MAX_RECONNECT_ATTEMPTS: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct Direct {
@@ -169,6 +165,12 @@ impl DirectActor {
                 || peer.accept_conn.get() == PeerState::Connecting
                 || peer.attempts.get() > MAX_RECONNECT_ATTEMPTS
             {
+                if let Some(stale_conn) = peer.conn.get() && peer.attempts.get() > MAX_RECONNECT_ATTEMPTS {
+                    debug!("Dropping stale connection to {} after {} failed attempts", id, peer.attempts.get());
+                    stale_conn.drop().await;
+                    peer.conn.set(None).ok();
+                }
+
                 continue;
             }
 
@@ -194,11 +196,13 @@ impl DirectActor {
                     if open_new {
                         let attempts = peer.attempts.clone();
                         attempts.set(attempts.get() + 1).ok();
+                        let s = peer.accept_conn.watch().stream();
                         Self::open_new_connection(
                             id,
                             peer.clone(),
                             self.endpoint.clone(),
                             self.direct_connect_tx.clone(),
+                            s,
                         )
                         .await;
                     }
@@ -221,13 +225,14 @@ impl DirectActor {
         peer: ConnGen,
         endpoint: Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
+        accept_stream: Stream<n0_watcher::Direct<PeerState>>,
     ) {
         peer.open_conn.set(PeerState::Connecting).ok();
 
         // Try open new connection
         tokio::spawn(async move {
             if let Ok(new_conn) =
-                Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx)
+                Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx, accept_stream)
                     .await
             {
                 debug!("Successfully established connection to {}", peer_id);
@@ -321,22 +326,30 @@ impl DirectActor {
         }
         peer.accept_conn.set(PeerState::Connecting).ok();
 
-        if let Ok(remote_conn) =
-            Conn::accept_connection(conn, self.direct_connect_tx.clone()).await
+        match Conn::accept_connection(
+            conn,
+            self.direct_connect_tx.clone(),
+            peer.open_conn.watch().stream(),
+        )
+        .await
         {
-            debug!("Successfully accepted connection from {}", remote_id);
-            peer.accept_conn
-                .set(PeerState::Connected(remote_conn.clone()))
-                .ok();
-            Ok(())
-        } else {
-            error!("Failed to accept connection from {}", remote_id);
+            Ok(remote_conn) => {
+                debug!("Successfully accepted connection from {}", remote_id);
+                peer.accept_conn
+                    .set(PeerState::Connected(remote_conn.clone()))
+                    .ok();
+                Ok(())
+            }
+            Err(err) => {
+                error!("Failed to accept connection from {}: {}", remote_id, err);
 
-            peer.accept_conn.set(PeerState::NoConnection).ok();
-            Err(anyhow::anyhow!(
-                "Failed to accept connection from {}",
-                remote_id
-            ))
+                peer.accept_conn.set(PeerState::NoConnection).ok();
+                Err(anyhow::anyhow!(
+                    "Failed to accept connection from {}: {}",
+                    remote_id,
+                    err
+                ))
+            }
         }
     }
 
