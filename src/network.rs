@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,11 +15,12 @@ use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
 use iroh_topic_tracker::TopicDiscoveryHook;
+use noq::congestion::BbrConfig;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    ConnState, Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp
+    ConnState, Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp,
 };
 
 const PENDING_TTL: Duration = Duration::from_secs(60);
@@ -55,32 +58,54 @@ struct NetworkActor {
     pending_packets: HashMap<std::net::Ipv4Addr, VecDeque<(Instant, Ipv4Pkg)>>,
 }
 
-fn transport_config() -> QuicTransportConfig {
-    const EXPECTED_RTT: u32 = 600;
-    const MAX_STREAM_BANDWIDTH: u32 = 125_000;
-    const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
-
+/*fn transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
-        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(60_000))))
-        .keep_alive_interval(Duration::from_millis(15_000))
-        .stream_receive_window(STREAM_RWND.into())
-        .receive_window(VarInt::MAX)
-        .send_window((4 * STREAM_RWND).into())
-        .send_fairness(true)
-        .packet_threshold(5)
-        .time_threshold(1.5)
-        .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
-        .initial_mtu(1280)
-        .min_mtu(1200)
-        .mtu_discovery_config(None)
-        .persistent_congestion_threshold(5)
-        .datagram_receive_buffer_size(Some(STREAM_RWND as usize))
-        .datagram_send_buffer_size(STREAM_RWND as usize)
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(10_000))))
+        .keep_alive_interval(Duration::from_millis(20_000))
         .build()
+}*/
+
+fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
+    const EXPECTED_RTT: u32 = 100;
+    //const MAX_STREAM_BANDWIDTH: u32 = 512_000;
+    const STREAM_RWND: u32 = 102_400;//MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
+
+    let mut transport = QuicTransportConfig::builder()
+        //.congestion_controller_factory(Arc::new(BbrConfig::default()))
+        .enable_segmentation_offload(false)
+        .packet_threshold(3)
+        .time_threshold(1.125)
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(45_000))))
+        .keep_alive_interval(Duration::from_millis(3_000))
+        .stream_receive_window(STREAM_RWND.into())
+        .send_window((4 * STREAM_RWND).into())
+        .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
+        .initial_mtu(1400)
+        .min_mtu(1300)
+        .datagram_receive_buffer_size(Some(65_536))
+        .datagram_send_buffer_size(65_536);
+
+    if let Some(log_path) = log_path {
+        if !log_path.exists()
+            && let Err(e) = std::fs::create_dir_all(&log_path)
+        {
+            error!("Failed to create qlog directory at {:?}: {}", log_path, e);
+        }
+        transport = transport.qlog_from_path(log_path, "iroh-lan");
+    }
+
+    transport.build()
 }
 
 impl Network {
     pub async fn new(name: &str, password: &str) -> Result<Self> {
+        Self::new_logs_dir(name, password, None).await
+    }
+    pub async fn new_logs_dir(
+        name: &str,
+        password: &str,
+        log_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let secret_key = SecretKey::generate(&mut rand::rng());
 
         let mut network_secret = sha2::Sha512::new();
@@ -90,11 +115,11 @@ impl Network {
 
         let auth = Authenticator::new(&network_secret);
         let topic_discovery_hook = TopicDiscoveryHook::new();
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .hooks(auth.clone())
             .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())
-            //.transport_config(transport_config())
+            .transport_config(transport_config(log_dir))
             .bind()
             .await?;
         auth.set_endpoint(&endpoint);
@@ -140,31 +165,27 @@ impl Network {
 
         direct.set_router(router.clone()).await?;
 
-        let (api, rx) = Handle::channel();
-        tokio::spawn(async move {
-            let (to_remote_writer, to_remote_reader) = tokio::sync::mpsc::channel(1024 * 16);
-            let mut actor = NetworkActor {
-                rx,
-                router,
-                direct,
-                _auth: auth,
+        let (to_remote_writer, to_remote_reader) = tokio::sync::mpsc::channel(1024 * 16);
+        let (api, _) = Handle::spawn(|rx| NetworkActor {
+            rx,
+            router,
+            direct,
+            _auth: auth,
 
-                _iroh_router,
-                //_docs_router,
-                iroh_endpoint: endpoint,
+            _iroh_router,
+            //_docs_router,
+            iroh_endpoint: endpoint,
 
-                tun: None,
-                tun_ip_debug: None,
-                _local_to_direct_tx: to_remote_writer,
-                local_to_direct_rx: to_remote_reader,
-                _direct_to_local_tx: direct_connect_tx,
-                direct_to_local_rx: direct_connect_rx,
+            tun: None,
+            tun_ip_debug: None,
+            _local_to_direct_tx: to_remote_writer,
+            local_to_direct_rx: to_remote_reader,
+            _direct_to_local_tx: direct_connect_tx,
+            direct_to_local_rx: direct_connect_rx,
 
-                ip_cache: HashMap::new(),
-                peer_ids: HashSet::new(),
-                pending_packets: HashMap::new(),
-            };
-            let _ = actor.run().await;
+            ip_cache: HashMap::new(),
+            peer_ids: HashSet::new(),
+            pending_packets: HashMap::new(),
         });
 
         Ok(Self { api })
@@ -317,24 +338,28 @@ impl Actor<anyhow::Error> for NetworkActor {
                                         continue;
                                     }
                                 }
-                                if let Some((id, mut queue)) = self
-                                    .ip_cache
-                                    .get(&ip)
-                                    .copied()
-                                    .zip(self.pending_packets.remove(&ip))
-                                {
-                                    let replay_count = queue.len();
-                                    info!(
-                                        "Replaying {} buffered packets for {} via {}",
-                                        replay_count,
-                                        ip,
-                                        id
-                                    );
-                                    while let Some((_, pkt)) = queue.pop_front() {
-                                        let direct = self.direct.clone();
-                                        tokio::spawn(async move {
-                                            let peer_state = direct.get_peer_state(id).await.ok();
-                                            if let Err(e) = direct.route_packet(id, DirectMessage::IpPacket(pkt)).await {
+                                if let Some(id) = self.ip_cache.get(&ip).copied() {
+                                    let peer_state = self.direct.get_peer_state(id).await;
+                                    if !matches!(peer_state, Ok(ConnState::Open)) {
+                                        continue;
+                                    }
+
+                                    if let Some(mut queue) = self.pending_packets.remove(&ip) {
+                                        let replay_count = queue.len();
+                                        info!(
+                                            "Replaying {} buffered packets for {} via {}",
+                                            replay_count,
+                                            ip,
+                                            id
+                                        );
+
+                                        let mut failed_queue = VecDeque::new();
+                                        while let Some((ts, pkt)) = queue.pop_front() {
+                                            if let Err(e) = self
+                                                .direct
+                                                .route_packet(id, DirectMessage::IpPacket(pkt.clone()))
+                                                .await
+                                            {
                                                 warn!(
                                                     "Failed to route buffered packet to {} for ip {} state={:?}: {}",
                                                     id,
@@ -342,8 +367,15 @@ impl Actor<anyhow::Error> for NetworkActor {
                                                     peer_state,
                                                     e
                                                 );
+                                                failed_queue.push_back((ts, pkt));
+                                                failed_queue.append(&mut queue);
+                                                break;
                                             }
-                                        });
+                                        }
+
+                                        if !failed_queue.is_empty() {
+                                            self.pending_packets.insert(ip, failed_queue);
+                                        }
                                     }
                                 }
                             }
@@ -440,7 +472,11 @@ impl NetworkActor {
         }
         queue.push_back((Instant::now(), pkt.clone()));
         if queue.len() == 1 || queue.len().is_multiple_of(256) {
-            info!("Buffered packet queue for {} now has {} packets", ip, queue.len());
+            info!(
+                "Buffered packet queue for {} now has {} packets",
+                ip,
+                queue.len()
+            );
         }
     }
 }

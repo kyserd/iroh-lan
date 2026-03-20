@@ -56,7 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     peers.dedup();
 
     if peers.is_empty() {
-        eprintln!("MESH_CHECK: FAIL no peers to test against (self_ip={})", self_ip);
+        eprintln!(
+            "MESH_CHECK: FAIL no peers to test against (self_ip={})",
+            self_ip
+        );
         std::process::exit(1);
     }
 
@@ -70,7 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
     let stats: Arc<Mutex<HashMap<Ipv4Addr, PeerStats>>> = Arc::new(Mutex::new(
-        peers.iter().copied().map(|ip| (ip, PeerStats::new())).collect(),
+        peers
+            .iter()
+            .copied()
+            .map(|ip| (ip, PeerStats::new()))
+            .collect(),
     ));
 
     let start = Instant::now();
@@ -90,15 +97,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = send_tick.tick() => {
                 let payload = format!("mesh:{}:{}", self_ip, start.elapsed().as_millis());
-                for ip in &peers {
-                    let addr = format!("{}:31000", ip);
-                    if socket.send_to(payload.as_bytes(), &addr).await.is_ok() {
-                        let mut guard = stats.lock().await;
-                        if let Some(s) = guard.get_mut(ip) {
-                            s.tx_count = s.tx_count.saturating_add(1);
+                let socket = Arc::clone(&socket);
+                let stats = Arc::clone(&stats);
+                let peers = peers.clone();
+                tokio::spawn(async move {
+                    for ip in &peers {
+                        let addr = format!("{}:31000", ip);
+                        if socket.send_to(payload.as_bytes(), &addr).await.is_ok() {
+                            let mut guard = stats.lock().await;
+                            if let Some(s) = guard.get_mut(ip) {
+                                s.tx_count = s.tx_count.saturating_add(1);
+                            }
+                        } else {
+                            eprintln!("MESH_CHECK: WARN failed to send to {}", addr);
                         }
                     }
-                }
+                });
+
             }
             recv = socket.recv_from(&mut recv_buf) => {
                 if let Ok((len, src)) = recv {
@@ -185,10 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             failed = true;
-            eprintln!(
-                "MESH_CHECK: FAIL peer={} never received any packet",
-                ip
-            );
+            eprintln!("MESH_CHECK: FAIL peer={} never received any packet", ip);
         }
 
         if s.max_gap > max_reconnect {

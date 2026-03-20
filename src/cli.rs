@@ -14,7 +14,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
-use std::{collections::HashSet, io, net::Ipv4Addr, time::Duration};
+use std::{collections::HashSet, io, net::Ipv4Addr, path::PathBuf, time::Duration};
 use tokio::time::sleep;
 
 use crate::{Network, RouterIp};
@@ -37,6 +37,10 @@ struct Args {
     /// Run headless with full tracing output
     #[arg(short = 't', long = "trace")]
     trace: bool,
+
+    /// Directory for qlog files
+    #[arg(long = "qlog-dir", value_name = "qlog", requires = "trace")]
+    qlog_dir: Option<PathBuf>,
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -53,7 +57,7 @@ pub async fn run_cli() -> Result<()> {
             .with(EnvFilter::new(
                 //"iroh_lan=debug,iroh_auth=debug,iroh_topic_tracker=debug,iroh=info,iroh_gossip=debug",
                 //"iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_quinn_proto=warn,condriver-unreachable=debug",
-                "iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_quinn_proto=warn,condriver-unreachable=debug",
+                "iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_quinn_proto=warn,condriver-unreachable=debug,iroh_auth=debug",
             ))
             .init();
     }
@@ -61,7 +65,7 @@ pub async fn run_cli() -> Result<()> {
     let headless = args.no_display || args.trace;
 
     if headless {
-        run_headless(args.name, args.password).await?;
+        run_headless(args.name, args.password, args.qlog_dir).await?;
     } else {
         run_tui(args.name, args.password).await?;
     }
@@ -69,9 +73,12 @@ pub async fn run_cli() -> Result<()> {
     Ok(())
 }
 
-async fn run_headless(name: String, password: String) -> Result<()> {
+async fn run_headless(name: String, password: String, qlog_dir: Option<PathBuf>) -> Result<()> {
     println!("Waiting for first peer connection...");
-    let network = Network::new(&name, &password).await?;
+    if let Some(qlog_dir) = &qlog_dir {
+        println!("qlog: {:?}", qlog_dir);
+    }
+    let network = Network::new_logs_dir(&name, &password, qlog_dir).await?;
     println!("Waiting for IP assignment...");
 
     loop {

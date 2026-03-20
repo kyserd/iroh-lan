@@ -94,7 +94,7 @@ impl Builder {
         let topic_discovery_config =
             TopicDiscoveryConfig::builder(signing_key, self.topic_discovery_hook.clone())
                 .connection_timeout(Duration::from_secs(15))
-                .announce_interval(Duration::from_secs(15*60))
+                .announce_interval(Duration::from_secs(15 * 60))
                 .dht_retries(None)
                 .build();
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
@@ -117,22 +117,17 @@ impl Builder {
 
         let kv = Kv::spawn(endpoint.id(), gossip_sender, gossip_receiver);
 
-        let (api, rx) = Handle::channel();
-        tokio::spawn(async move {
-            let mut router_actor = RouterActor {
-                kv,
-                _endpoint: endpoint.clone(),
-                endpoint_id: endpoint.id(),
-                _topic: topic_handle,
-                rx,
-                my_ip: RouterIp::NoIp,
-                assignments: BTreeMap::new(),
-                candidates: BTreeMap::new(),
-                startup_entries: BTreeSet::new(),
-            };
-            router_actor.run().await
+        let (api, _) = Handle::spawn(|rx| RouterActor {
+            kv,
+            _endpoint: endpoint.clone(),
+            endpoint_id: endpoint.id(),
+            _topic: topic_handle,
+            rx,
+            my_ip: RouterIp::NoIp,
+            assignments: BTreeMap::new(),
+            candidates: BTreeMap::new(),
+            startup_entries: BTreeSet::new(),
         });
-
         Ok(Router { api })
     }
 }
@@ -234,7 +229,6 @@ impl Actor<anyhow::Error> for RouterActor {
 
         let mut kv_sub = self.kv.subscribe();
         self.populate_from_kv().await;
-
 
         loop {
             tokio::select! {
@@ -383,7 +377,9 @@ fn decode_ip_assignment(key: &str, timestamp: u64) -> Result<IpAssignment> {
         );
         anyhow::bail!("Invalid key format for IpAssignment");
     }
-    if let (Ok(ip), Ok(endpoint_id)) = (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>()) {
+    if let (Ok(ip), Ok(endpoint_id)) =
+        (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>())
+    {
         Ok(IpAssignment {
             ip,
             endpoint_id,
@@ -415,7 +411,9 @@ fn decode_ip_candidate(key: &str, timestamp: u64) -> Result<IpCandidate> {
         );
         anyhow::bail!("Invalid key format for IpCandidate");
     }
-    if let (Ok(ip), Ok(endpoint_id)) = (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>()) {
+    if let (Ok(ip), Ok(endpoint_id)) =
+        (parts[3].parse::<Ipv4Addr>(), parts[4].parse::<EndpointId>())
+    {
         Ok(IpCandidate {
             ip,
             endpoint_id,

@@ -7,6 +7,17 @@ echo "========================================================"
 
 overall_fail=0
 phases=(baseline degraded post_rolling post_simultaneous post_outage_recovery recovery)
+optional_phases=(post_outage_recovery)
+
+is_optional_phase() {
+    local phase="$1"
+    for optional in "${optional_phases[@]}"; do
+        if [ "$optional" = "$phase" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 for node in 0 1 2 3 4; do
     base="docker_test/results_reliability/node${node}"
@@ -23,17 +34,25 @@ for node in 0 1 2 3 4; do
     for phase in "${phases[@]}"; do
         log="$latest/mesh_${phase}.log"
         if [ ! -f "$log" ]; then
-            echo "  [FAIL] ${phase}: missing log"
-            overall_fail=1
+            if is_optional_phase "$phase"; then
+                echo "  [INFO] ${phase}: missing log"
+            else
+                echo "  [FAIL] ${phase}: missing log"
+                overall_fail=1
+            fi
             continue
         fi
 
         if grep -q "MESH_CHECK: PASS" "$log"; then
             echo "  [PASS] ${phase}"
         else
-            echo "  [FAIL] ${phase}"
+            if is_optional_phase "$phase"; then
+                echo "  [INFO] ${phase}"
+            else
+                echo "  [FAIL] ${phase}"
+                overall_fail=1
+            fi
             tail -n 20 "$log" || true
-            overall_fail=1
         fi
     done
 

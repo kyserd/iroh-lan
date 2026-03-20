@@ -1,9 +1,14 @@
-use actor_helper::{Action, Handle, act, act_ok};
+use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId, Watcher, endpoint::Connection, protocol::ProtocolHandler};
 use n0_watcher::{Stream, Watchable};
+use noq::VarInt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    time::Duration,
+};
+use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
 use crate::{ConnState, Router, RouterIp, connection::Conn, local_networking::Ipv4Pkg};
@@ -25,6 +30,7 @@ pub enum PeerState {
 #[derive(Debug, Clone)]
 pub struct ConnGen {
     conn: Watchable<Option<Conn>>,
+    promoted: Watchable<Option<Instant>>,
     accept_conn: Watchable<PeerState>,
     open_conn: Watchable<PeerState>,
     attempts: Watchable<usize>,
@@ -34,6 +40,7 @@ impl Default for ConnGen {
     fn default() -> Self {
         Self {
             conn: Watchable::new(None),
+            promoted: Watchable::new(None),
             accept_conn: Watchable::new(PeerState::NoConnection),
             open_conn: Watchable::new(PeerState::NoConnection),
             attempts: Watchable::new(0),
@@ -62,16 +69,16 @@ impl Direct {
         endpoint: iroh::endpoint::Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     ) -> Self {
-        let (api, rx) = Handle::channel();
-        let mut actor = DirectActor {
+        let (api, _) = Handle::spawn(|rx| DirectActor {
             peers: HashMap::new(),
             endpoint,
             rx,
             direct_connect_tx,
             router: None,
-        };
-        tokio::spawn(async move { actor.run().await });
-        Self { api }
+        });
+        Self {
+            api
+        }
     }
 
     pub async fn handle_connection(&self, conn: Connection) -> Result<()> {
@@ -116,8 +123,8 @@ impl Direct {
     }
 }
 
-impl DirectActor {
-    async fn run(&mut self) -> Result<()> {
+impl Actor<anyhow::Error> for DirectActor {
+    async fn run(&mut self) -> Result<(), anyhow::Error> {
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -137,13 +144,16 @@ impl DirectActor {
                     self.connection_driver().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
-                     info!("Ctrl-C received, shutting down DirectActor");
+                    info!("Ctrl-C received, shutting down DirectActor");
                     break
                 }
             }
         }
         Ok(())
     }
+}
+
+impl DirectActor {
 
     /*
     async fn prune_closed_connections(&mut self) {
@@ -160,13 +170,20 @@ impl DirectActor {
     } */
 
     async fn connection_driver(&mut self) {
+        println!("conn_driver_tick");
         for (id, peer) in self.peers.clone() {
             if peer.open_conn.get() == PeerState::Connecting
                 || peer.accept_conn.get() == PeerState::Connecting
                 || peer.attempts.get() > MAX_RECONNECT_ATTEMPTS
             {
-                if let Some(stale_conn) = peer.conn.get() && peer.attempts.get() > MAX_RECONNECT_ATTEMPTS {
-                    debug!("Dropping stale connection to {} after {} failed attempts", id, peer.attempts.get());
+                if let Some(stale_conn) = peer.conn.get()
+                    && peer.attempts.get() > MAX_RECONNECT_ATTEMPTS
+                {
+                    debug!(
+                        "Dropping stale connection to {} after {} failed attempts",
+                        id,
+                        peer.attempts.get()
+                    );
                     stale_conn.drop().await;
                     peer.conn.set(None).ok();
                 }
@@ -231,30 +248,39 @@ impl DirectActor {
 
         // Try open new connection
         tokio::spawn(async move {
-            if let Ok(new_conn) =
-                Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx, accept_stream)
+            info!("Attempting to open new connection to {}", peer_id);
+            match Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx, accept_stream)
                     .await
             {
-                debug!("Successfully established connection to {}", peer_id);
+                Ok(new_conn) => {
+                    debug!("Successfully established connection to {}", peer_id);
+                if peer.open_conn.get() != PeerState::Connecting {
+                    debug!("Connection to {} is no longer in Connecting state, dropping new connection", peer_id);
+                    new_conn.drop().await;
+                    return;
+                }
                 peer.open_conn
                     .set(PeerState::Connected(new_conn.clone()))
                     .ok();
-            } else {
-                error!("Failed to establish connection to {}", peer_id);
-                peer.open_conn.set(PeerState::NoConnection).ok();
+                },
+                Err(err) => {
+                    
+                    error!("Failed to establish connection to {}: {}: {:?}", peer_id, err, err);
+                    peer.open_conn.set(PeerState::NoConnection).ok();
+                },
             }
         });
     }
 
     async fn promote_new_conn(&mut self, peer: ConnGen, peer_id: EndpointId) {
         debug!("Promoting new connection to {}", peer_id);
-        if let Some(old_conn) = peer.conn.get() {
-            debug!("Dropping old connection to {}", peer_id);
-            old_conn.drop().await;
-        }
 
         match (peer.open_conn.get(), peer.accept_conn.get()) {
             (PeerState::Connected(open), PeerState::Connected(accept)) => {
+                if let Some(old_conn) = peer.conn.get() {
+                    debug!("Dropping old connection to {} during promotion", peer_id);
+                    old_conn.drop().await;
+                }
                 if peer_id < self.endpoint.id() {
                     debug!("Promoting accept connection for {}", peer_id);
                     peer.conn.set(Some(accept)).ok();
@@ -269,18 +295,57 @@ impl DirectActor {
                 peer.open_conn.set(PeerState::NoConnection).ok();
                 peer.accept_conn.set(PeerState::NoConnection).ok();
                 peer.attempts.set(0).ok();
+                peer.promoted.set(Some(Instant::now())).ok();
             }
             (PeerState::Connected(open), PeerState::NoConnection) => {
+                if let Some(promoted) = peer.promoted.get()
+                    && promoted.elapsed() < Duration::from_secs(3)
+                {
+                    println!("RACE Accept");
+                }
+                if let Some(promoted) = peer.promoted.get()
+                    && promoted.elapsed() < Duration::from_secs(3)
+                    && peer_id >= self.endpoint.id()
+                {
+                    info!("Probably a race, not promoting, lost peer_id comparison (open)");
+                    peer.open_conn.set(PeerState::NoConnection).ok();
+                    open.drop().await;
+                    return;
+                }
                 debug!("Promoting open connection for {}", peer_id);
+                if let Some(old_conn) = peer.conn.get() {
+                    debug!("Dropping old connection to {} during promotion", peer_id);
+                    old_conn.drop().await;
+                }
                 peer.conn.set(Some(open)).ok();
                 peer.open_conn.set(PeerState::NoConnection).ok();
                 peer.attempts.set(0).ok();
+                peer.promoted.set(Some(Instant::now())).ok();
             }
             (PeerState::NoConnection, PeerState::Connected(accept)) => {
+                if let Some(promoted) = peer.promoted.get()
+                    && promoted.elapsed() < Duration::from_secs(3)
+                {
+                    println!("RACE Accept");
+                }
+                if let Some(promoted) = peer.promoted.get()
+                    && promoted.elapsed() < Duration::from_secs(3)
+                    && peer_id < self.endpoint.id()
+                {
+                    info!("Probably a race, not promoting, lost peer_id comparison (accept)");
+                    peer.accept_conn.set(PeerState::NoConnection).ok();
+                    accept.drop().await;
+                    return;
+                }
                 debug!("Promoting accept connection for {}", peer_id);
+                if let Some(old_conn) = peer.conn.get() {
+                    debug!("Dropping old connection to {} during promotion", peer_id);
+                    old_conn.drop().await;
+                }
                 peer.conn.set(Some(accept)).ok();
                 peer.accept_conn.set(PeerState::NoConnection).ok();
                 peer.attempts.set(0).ok();
+                peer.promoted.set(Some(Instant::now())).ok();
             }
             _ => {
                 unreachable!("Invalid state during promotion for {}", peer_id);
@@ -289,75 +354,89 @@ impl DirectActor {
     }
 
     async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) -> Result<()> {
-        info!("New direct connection from {:?}", conn.remote_id());
-        let remote_id = conn.remote_id();
-        if let Some(router) = &self.router {
-            if !matches!(router.get_ip_state().await, Ok(RouterIp::AssignedIp(_))) {
-                info!(
-                    "Accepting connection from {} before local IP assignment",
-                    remote_id
-                );
-            }
-
-            if router.get_ip_from_endpoint_id(remote_id).await.is_err() {
-                info!(
-                    "Accepting connection from {} before remote IP assignment",
-                    remote_id
-                );
-            }
-        } else {
-            info!(
-                "Accepting connection from {} before router ready",
-                remote_id
-            );
-        }
-
-        let remote_id = conn.remote_id();
-        let peer = self.peers.entry(remote_id).or_default().clone();
+        info!("Handling new connection from {}", conn.remote_id());
+        let router = self.router.clone();
+        let peer = self.peers.entry(conn.remote_id()).or_default().clone();
+        let direct_connect_tx = self.direct_connect_tx.clone();
         if peer.accept_conn.get() != PeerState::NoConnection {
             error!(
                 "Already have an active or pending connection with {}, rejecting new connection",
-                remote_id
+                conn.remote_id()
             );
             return Err(anyhow::anyhow!(
                 "Already have an active or pending connection with {}",
-                remote_id
+                conn.remote_id()
             ));
         }
         peer.accept_conn.set(PeerState::Connecting).ok();
 
-        match Conn::accept_connection(
-            conn,
-            self.direct_connect_tx.clone(),
-            peer.open_conn.watch().stream(),
-        )
-        .await
-        {
-            Ok(remote_conn) => {
-                debug!("Successfully accepted connection from {}", remote_id);
-                peer.accept_conn
-                    .set(PeerState::Connected(remote_conn.clone()))
-                    .ok();
-                Ok(())
-            }
-            Err(err) => {
-                error!("Failed to accept connection from {}: {}", remote_id, err);
+        tokio::spawn(async move {
+            info!("New direct connection from {:?}", conn.remote_id());
+            let remote_id = conn.remote_id();
+            if let Some(router) = &router {
+                if !matches!(router.get_ip_state().await, Ok(RouterIp::AssignedIp(_))) {
+                    info!(
+                        "Accepting connection from {} before local IP assignment",
+                        remote_id
+                    );
+                }
 
-                peer.accept_conn.set(PeerState::NoConnection).ok();
-                Err(anyhow::anyhow!(
-                    "Failed to accept connection from {}: {}",
-                    remote_id,
-                    err
-                ))
+                if router.get_ip_from_endpoint_id(remote_id).await.is_err() {
+                    info!(
+                        "Accepting connection from {} before remote IP assignment",
+                        remote_id
+                    );
+                }
+            } else {
+                info!(
+                    "Accepting connection from {} before router ready",
+                    remote_id
+                );
             }
-        }
+
+            let remote_id = conn.remote_id();
+            
+            match Conn::accept_connection(
+                conn.clone(),
+                direct_connect_tx.clone(),
+                peer.open_conn.watch().stream(),
+            )
+            .await
+            {
+                Ok(remote_conn) => {
+                    debug!("Successfully accepted connection from {}", remote_id);
+                    if peer.accept_conn.get() != PeerState::Connecting {
+                        debug!("Connection to {} is no longer in Connecting state, dropping accepted connection", remote_id);
+                        remote_conn.drop().await;
+                        return Ok(());
+                    }
+                    peer.accept_conn
+                        .set(PeerState::Connected(remote_conn.clone()))
+                        .ok();
+                    Ok(())
+                }
+                Err(err) => {
+                    error!("Failed to accept connection from {}: {}", remote_id, err);
+
+                    peer.accept_conn.set(PeerState::NoConnection).ok();
+                    conn.close(VarInt::from_u32(411), b"Failed to accept connection");
+                    Err(anyhow::anyhow!(
+                        "Failed to accept connection from {}: {}",
+                        remote_id,
+                        err
+                    ))
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn route_packet(&mut self, to: EndpointId, pkg: DirectMessage) -> Result<()> {
         trace!("Routing packet to {}", to);
         match self.peers.entry(to) {
             Entry::Occupied(entry) => {
-                let local_conn = if let Some(conn) = entry.get().conn.get() {
+                let peer = entry.get();
+                let local_conn = if let Some(conn) = peer.conn.get() {
                     conn
                 } else {
                     return Err(anyhow::anyhow!(
@@ -365,6 +444,15 @@ impl DirectActor {
                         to
                     ));
                 };
+                if local_conn.get_state().await.get() != ConnState::Open
+                    || peer.accept_conn.get() != PeerState::NoConnection
+                    || peer.open_conn.get() != PeerState::NoConnection
+                {
+                    return Err(anyhow::anyhow!(
+                        "Connection to {} is not currently open",
+                        to
+                    ));
+                }
                 if let Err(e) = local_conn.write(pkg).await {
                     error!("Failed to write packet to peer {}: {}", to, e);
                     return Err(e);
@@ -373,6 +461,7 @@ impl DirectActor {
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
                 entry.insert(Default::default());
+                return Err(anyhow::anyhow!("No active connection to {}, initiating new connection", to));
             }
         }
 
@@ -397,6 +486,11 @@ impl DirectActor {
             .peers
             .get(&endpoint_id)
             .ok_or(anyhow::anyhow!("no connection to peer"))?;
+        if peer.open_conn.get() != PeerState::NoConnection
+            || peer.accept_conn.get() != PeerState::NoConnection
+        {
+            return Ok(ConnState::Connecting);
+        }
         if let Some(conn) = peer.conn.get() {
             return Ok(conn.get_state().await.get());
         }
@@ -426,6 +520,7 @@ impl ProtocolHandler for Direct {
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
+        info!("ProtocolHandler: new conn: {}",connection.remote_id());
         let _ = self.handle_connection(connection).await;
         Ok(())
     }

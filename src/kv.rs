@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -299,7 +294,7 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
         .map(|peer| (peer, None))
         .collect::<BTreeMap<_, _>>();
     let peer_disconnect_timings = Watchable::new(init_peers);
-    
+
     // On startup, schedule an initial state broadcast so any existing peers
     // learn about keys we may have inserted before the worker started.
     schedule_state(&mut state_timer, &mut state_pending);
@@ -428,7 +423,11 @@ async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) -> bool 
     let msg: Message = match postcard::from_bytes(raw) {
         Ok(m) => m,
         Err(e) => {
-            warn!("[Kv] ignoring unparseable gossip message (len={}): {}", raw.len(), e);
+            warn!(
+                "[Kv] ignoring unparseable gossip message (len={}): {}",
+                raw.len(),
+                e
+            );
             return false;
         }
     };
