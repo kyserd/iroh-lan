@@ -1,23 +1,22 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
-    endpoint::{IdleTimeout, QuicTransportConfig, VarInt},
+    Endpoint, EndpointId, RelayConfig, RelayMap, SecretKey, endpoint::{Connection, IdleTimeout, QuicTransportConfig, VarInt}, protocol::ProtocolHandler
 };
 use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
+use iroh_relay::RelayQuicConfig;
 use iroh_topic_tracker::TopicDiscoveryHook;
-use noq::congestion::BbrConfig;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
+use url::Url;
 
 use crate::{
     ConnState, Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp,
@@ -81,7 +80,7 @@ fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
         .send_window((4 * STREAM_RWND).into())
         .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
         .initial_mtu(1400)
-        .min_mtu(1300)
+        .min_mtu(1400)
         .datagram_receive_buffer_size(Some(65_536))
         .datagram_send_buffer_size(65_536);
 
@@ -97,6 +96,24 @@ fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
     transport.build()
 }
 
+fn rustonbsd_relay() -> RelayConfig {
+    let url: Url = format!("https://iroh-relay.rustonbsd.com/")
+        .parse()
+        .expect("default url");
+    RelayConfig {
+        url: url.into(),
+        quic: Some(RelayQuicConfig::default()),
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DummyProtocol;
+impl ProtocolHandler for DummyProtocol {
+    async fn accept(&self, _conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        Ok(())
+    }
+}
 impl Network {
     pub async fn new(name: &str, password: &str) -> Result<Self> {
         Self::new_logs_dir(name, password, None).await
@@ -115,7 +132,11 @@ impl Network {
 
         let auth = Authenticator::new(&network_secret);
         let topic_discovery_hook = TopicDiscoveryHook::new();
+        let relay_map = RelayMap::from_iter([rustonbsd_relay()]);
+        relay_map.extend(&iroh::defaults::prod::default_relay_map());
+
         let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Custom(relay_map))
             .hooks(auth.clone())
             .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())

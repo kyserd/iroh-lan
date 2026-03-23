@@ -26,10 +26,12 @@ clean-test:
 	sudo docker compose -f docker_test/compose-stress.yaml down -v
 
 reliability-test: build
-	sudo rm docker_test/results_reliability/node*/*.log -r; \
+	mkdir -p docker_test/results_reliability/node0 docker_test/results_reliability/node1 docker_test/results_reliability/node2 docker_test/results_reliability/node3 docker_test/results_reliability/node4; \
 	TOPIC="reliability_$$RANDOM"; \
+	RUN_ID=$$(date +%Y%m%d_%H%M%S); \
 	echo "Using TOPIC=$$TOPIC"; \
-	sudo -E TOPIC=$$TOPIC RECONNECT_MAX_SEC=60 docker compose -f docker_test/compose-reliability.yaml up --build --abort-on-container-exit --remove-orphans; \
+	echo "Using RUN_ID=$$RUN_ID"; \
+	sudo -E TOPIC=$$TOPIC RUN_ID=$$RUN_ID RECONNECT_MAX_SEC=60 docker compose -f docker_test/compose-reliability.yaml up --build --abort-on-container-exit --remove-orphans; \
 	echo ""; \
 	chmod +x ./docker_test/check_reliability_logs.sh; \
 	./docker_test/check_reliability_logs.sh

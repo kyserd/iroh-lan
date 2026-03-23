@@ -21,10 +21,10 @@ is_optional_phase() {
 
 for node in 0 1 2 3 4; do
     base="docker_test/results_reliability/node${node}"
-    latest=$(ls -td "$base"/*/ 2>/dev/null | head -n1 || true)
+    latest=$(find "$base" -mindepth 1 -maxdepth 1 -type d -name '20[0-9][0-9][0-1][0-9][0-3][0-9]_[0-2][0-9][0-5][0-9][0-5][0-9]' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)
 
     if [ -z "$latest" ]; then
-        echo "[FAIL] node${node}: no log directory found"
+        echo "[FAIL] node${node}: no timestamped log directory found"
         overall_fail=1
         continue
     fi

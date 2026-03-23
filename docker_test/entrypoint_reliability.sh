@@ -2,9 +2,12 @@
 set -e
 set -o pipefail
 
-LOG_DIR="/app/results"
+RESULTS_DIR="/app/results"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+LOG_DIR="$RESULTS_DIR/$RUN_ID"
+QLOG_DIR="$LOG_DIR/qlog.log"
 COORD_DIR="/coord"
-mkdir -p "$LOG_DIR" "$COORD_DIR"
+mkdir -p "$LOG_DIR" "$QLOG_DIR" "$COORD_DIR"
 
 NODE_INDEX="${NODE_INDEX:-0}"
 NODE_COUNT="${NODE_COUNT:-5}"
@@ -28,6 +31,7 @@ OUTAGE_RECOVERY_MAX_SEC="${OUTAGE_RECOVERY_MAX_SEC:-30}"
 IROH_PID=""
 MY_IP=""
 TUN_DEV=""
+LOGS_COLLECTED=0
 
 # echo the mesh_check durations and max_reconnect to make sure they make sense
 echo "Mesh phase durations and settings:"
@@ -50,20 +54,56 @@ tc qdisc add dev eth0 root netem delay 300ms 100ms distribution normal loss 1.5%
 #tc qdisc replace dev eth0 root netem delay 1200ms 400ms reorder 35% 50% loss 35% 10% rate 6mbit limit 4000
 
 collect_logs() {
-    local exit_code=$?
-    local ts
-    ts=$(date +%Y%m%d_%H%M%S)
-    local out_dir="$LOG_DIR/$ts"
-    mkdir -p "$out_dir"
+    local exit_code="${1:-$?}"
 
-    for f in "$LOG_DIR"/*.log; do
-        [ -f "$f" ] && cp -f "$f" "$out_dir/"
-    done
+    if [ "$LOGS_COLLECTED" -eq 1 ]; then
+        return
+    fi
+    LOGS_COLLECTED=1
 
-    echo "[node${NODE_INDEX}] Saved logs to $out_dir (exit=$exit_code)"
+    sync "$LOG_DIR" 2>/dev/null || true
+    echo "[node${NODE_INDEX}] Saved logs to $LOG_DIR (exit=$exit_code)"
 }
 
-trap collect_logs EXIT
+finalize_and_exit() {
+    local exit_code="$1"
+
+    trap - EXIT TERM INT
+
+    stop_iroh
+    tc qdisc del dev eth0 root 2>/dev/null || true
+    collect_logs "$exit_code"
+
+    exit "$exit_code"
+}
+
+handle_term() {
+    local exit_code=143
+
+    if [ -f "$COORD_DIR/TEST_PASS" ]; then
+        exit_code=0
+    fi
+
+    echo "[node${NODE_INDEX}] received SIGTERM"
+    finalize_and_exit "$exit_code"
+}
+
+handle_int() {
+    echo "[node${NODE_INDEX}] received SIGINT"
+    finalize_and_exit 130
+}
+
+handle_exit() {
+    local exit_code=$?
+
+    trap - EXIT
+    collect_logs "$exit_code"
+    exit "$exit_code"
+}
+
+trap handle_exit EXIT
+trap handle_term TERM
+trap handle_int INT
 
 signal() {
     local name="$1"
@@ -122,7 +162,7 @@ wait_all_signals() {
 start_iroh() {
     local logfile="$1"
     > "$logfile"
-    /app/bin/iroh-lan "$TOPIC" -t --qlog-dir "$LOG_DIR/qlog.log" >> "$logfile" 2>&1 &
+    /app/bin/iroh-lan "$TOPIC" -t --qlog-dir "$QLOG_DIR" >> "$logfile" 2>&1 &
     IROH_PID=$!
     echo "[node${NODE_INDEX}] started iroh pid=$IROH_PID log=$logfile"
 }

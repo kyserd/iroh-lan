@@ -1,7 +1,7 @@
 use actor_helper::{Action, Actor, Handle, act, act_ok};
 use anyhow::Result;
-use iroh::{Endpoint, EndpointId, Watcher, endpoint::Connection, protocol::ProtocolHandler};
-use n0_watcher::{Stream, Watchable};
+use iroh::{Endpoint, EndpointId, endpoint::Connection, protocol::ProtocolHandler};
+use n0_watcher::Watchable;
 use noq::VarInt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,9 +76,7 @@ impl Direct {
             direct_connect_tx,
             router: None,
         });
-        Self {
-            api
-        }
+        Self { api }
     }
 
     pub async fn handle_connection(&self, conn: Connection) -> Result<()> {
@@ -154,7 +152,6 @@ impl Actor<anyhow::Error> for DirectActor {
 }
 
 impl DirectActor {
-
     /*
     async fn prune_closed_connections(&mut self) {
         let mut to_remove = Vec::new();
@@ -172,10 +169,7 @@ impl DirectActor {
     async fn connection_driver(&mut self) {
         println!("conn_driver_tick");
         for (id, peer) in self.peers.clone() {
-            if peer.open_conn.get() == PeerState::Connecting
-                || peer.accept_conn.get() == PeerState::Connecting
-                || peer.attempts.get() > MAX_RECONNECT_ATTEMPTS
-            {
+            if peer.attempts.get() > MAX_RECONNECT_ATTEMPTS {
                 if let Some(stale_conn) = peer.conn.get()
                     && peer.attempts.get() > MAX_RECONNECT_ATTEMPTS
                 {
@@ -193,8 +187,8 @@ impl DirectActor {
 
             match (peer.open_conn.get(), peer.accept_conn.get()) {
                 (PeerState::Connected(_), PeerState::Connected(_))
-                | (PeerState::Connected(_), PeerState::NoConnection)
-                | (PeerState::NoConnection, PeerState::Connected(_)) => {
+                | (PeerState::Connected(_), PeerState::NoConnection | PeerState::Connecting)
+                | (PeerState::NoConnection | PeerState::Connecting, PeerState::Connected(_)) => {
                     self.promote_new_conn(peer, id).await;
                 }
                 (PeerState::NoConnection, PeerState::NoConnection) => {
@@ -213,24 +207,22 @@ impl DirectActor {
                     if open_new {
                         let attempts = peer.attempts.clone();
                         attempts.set(attempts.get() + 1).ok();
-                        let s = peer.accept_conn.watch().stream();
                         Self::open_new_connection(
                             id,
                             peer.clone(),
                             self.endpoint.clone(),
                             self.direct_connect_tx.clone(),
-                            s,
                         )
                         .await;
                     }
                 }
                 _ => {
-                    debug!(
+                    /*debug!(
                         "Peer {} is in intermediate state (open={:?}, accept={:?}), skipping",
                         id,
                         peer.open_conn.get(),
                         peer.accept_conn.get()
-                    );
+                    );*/
                     continue;
                 }
             }
@@ -242,32 +234,34 @@ impl DirectActor {
         peer: ConnGen,
         endpoint: Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
-        accept_stream: Stream<n0_watcher::Direct<PeerState>>,
     ) {
         peer.open_conn.set(PeerState::Connecting).ok();
 
         // Try open new connection
         tokio::spawn(async move {
             info!("Attempting to open new connection to {}", peer_id);
-            match Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx, accept_stream)
-                    .await
-            {
+            match Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx).await {
                 Ok(new_conn) => {
                     debug!("Successfully established connection to {}", peer_id);
-                if peer.open_conn.get() != PeerState::Connecting {
-                    debug!("Connection to {} is no longer in Connecting state, dropping new connection", peer_id);
-                    new_conn.drop().await;
-                    return;
+                    if peer.open_conn.get() != PeerState::Connecting {
+                        debug!(
+                            "Connection to {} is no longer in Connecting state, dropping new connection",
+                            peer_id
+                        );
+                        new_conn.drop().await;
+                        return;
+                    }
+                    peer.open_conn
+                        .set(PeerState::Connected(new_conn.clone()))
+                        .ok();
                 }
-                peer.open_conn
-                    .set(PeerState::Connected(new_conn.clone()))
-                    .ok();
-                },
                 Err(err) => {
-                    
-                    error!("Failed to establish connection to {}: {}: {:?}", peer_id, err, err);
+                    error!(
+                        "Failed to establish connection to {}: {}: {:?}",
+                        peer_id, err, err
+                    );
                     peer.open_conn.set(PeerState::NoConnection).ok();
-                },
+                }
             }
         });
     }
@@ -297,21 +291,21 @@ impl DirectActor {
                 peer.attempts.set(0).ok();
                 peer.promoted.set(Some(Instant::now())).ok();
             }
-            (PeerState::Connected(open), PeerState::NoConnection) => {
-                if let Some(promoted) = peer.promoted.get()
+            (PeerState::Connected(open), PeerState::NoConnection | PeerState::Connecting) => {
+                /*if let Some(promoted) = peer.promoted.get()
                     && promoted.elapsed() < Duration::from_secs(3)
                 {
                     println!("RACE Accept");
                 }
                 if let Some(promoted) = peer.promoted.get()
                     && promoted.elapsed() < Duration::from_secs(3)
-                    && peer_id >= self.endpoint.id()
+                    && peer_id < self.endpoint.id()
                 {
                     info!("Probably a race, not promoting, lost peer_id comparison (open)");
                     peer.open_conn.set(PeerState::NoConnection).ok();
                     open.drop().await;
                     return;
-                }
+                }*/
                 debug!("Promoting open connection for {}", peer_id);
                 if let Some(old_conn) = peer.conn.get() {
                     debug!("Dropping old connection to {} during promotion", peer_id);
@@ -322,21 +316,21 @@ impl DirectActor {
                 peer.attempts.set(0).ok();
                 peer.promoted.set(Some(Instant::now())).ok();
             }
-            (PeerState::NoConnection, PeerState::Connected(accept)) => {
-                if let Some(promoted) = peer.promoted.get()
+            (PeerState::NoConnection | PeerState::Connecting, PeerState::Connected(accept)) => {
+                /*if let Some(promoted) = peer.promoted.get()
                     && promoted.elapsed() < Duration::from_secs(3)
                 {
                     println!("RACE Accept");
                 }
                 if let Some(promoted) = peer.promoted.get()
                     && promoted.elapsed() < Duration::from_secs(3)
-                    && peer_id < self.endpoint.id()
+                    && peer_id >= self.endpoint.id()
                 {
                     info!("Probably a race, not promoting, lost peer_id comparison (accept)");
                     peer.accept_conn.set(PeerState::NoConnection).ok();
                     accept.drop().await;
                     return;
-                }
+                }*/
                 debug!("Promoting accept connection for {}", peer_id);
                 if let Some(old_conn) = peer.conn.get() {
                     debug!("Dropping old connection to {} during promotion", peer_id);
@@ -395,18 +389,15 @@ impl DirectActor {
             }
 
             let remote_id = conn.remote_id();
-            
-            match Conn::accept_connection(
-                conn.clone(),
-                direct_connect_tx.clone(),
-                peer.open_conn.watch().stream(),
-            )
-            .await
-            {
+
+            match Conn::accept_connection(conn.clone(), direct_connect_tx.clone()).await {
                 Ok(remote_conn) => {
                     debug!("Successfully accepted connection from {}", remote_id);
                     if peer.accept_conn.get() != PeerState::Connecting {
-                        debug!("Connection to {} is no longer in Connecting state, dropping accepted connection", remote_id);
+                        debug!(
+                            "Connection to {} is no longer in Connecting state, dropping accepted connection",
+                            remote_id
+                        );
                         remote_conn.drop().await;
                         return Ok(());
                     }
@@ -444,10 +435,7 @@ impl DirectActor {
                         to
                     ));
                 };
-                if local_conn.get_state().await.get() != ConnState::Open
-                    || peer.accept_conn.get() != PeerState::NoConnection
-                    || peer.open_conn.get() != PeerState::NoConnection
-                {
+                if local_conn.get_state().await.get() != ConnState::Open {
                     return Err(anyhow::anyhow!(
                         "Connection to {} is not currently open",
                         to
@@ -461,7 +449,10 @@ impl DirectActor {
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
                 entry.insert(Default::default());
-                return Err(anyhow::anyhow!("No active connection to {}, initiating new connection", to));
+                return Err(anyhow::anyhow!(
+                    "No active connection to {}, initiating new connection",
+                    to
+                ));
             }
         }
 
@@ -486,13 +477,13 @@ impl DirectActor {
             .peers
             .get(&endpoint_id)
             .ok_or(anyhow::anyhow!("no connection to peer"))?;
+        if let Some(conn) = peer.conn.get() {
+            return Ok(conn.get_state().await.get());
+        }
         if peer.open_conn.get() != PeerState::NoConnection
             || peer.accept_conn.get() != PeerState::NoConnection
         {
             return Ok(ConnState::Connecting);
-        }
-        if let Some(conn) = peer.conn.get() {
-            return Ok(conn.get_state().await.get());
         }
         Ok(ConnState::Closed)
     }
@@ -520,7 +511,7 @@ impl ProtocolHandler for Direct {
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
-        info!("ProtocolHandler: new conn: {}",connection.remote_id());
+        info!("ProtocolHandler: new conn: {}", connection.remote_id());
         let _ = self.handle_connection(connection).await;
         Ok(())
     }

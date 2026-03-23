@@ -2097,9 +2097,8 @@ dependencies = [
 [[package]]
 name = "iroh-auth"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30ea1ad7e5e2452f67822053126eefbc07577cdff90dcd014589475b1b206ea0"
 dependencies = [
+ "bytes",
  "hkdf",
  "iroh",
  "n0-future",
@@ -2178,6 +2177,7 @@ dependencies = [
  "iroh",
  "iroh-auth",
  "iroh-gossip",
+ "iroh-relay",
  "iroh-topic-tracker",
  "n0-watcher",
  "nix 0.31.1",
@@ -2194,6 +2194,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun-rs",
+ "url",
  "z32",
 ]
 

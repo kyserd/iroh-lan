@@ -36,12 +36,14 @@ chrono = { version = "0.4" }
 n0-watcher = "0.6"
 
 #iroh-auth = { version = "0.1.2" }
-iroh-auth = "0.1.4"
+iroh-auth = { path="../iroh-auth" } #"0.1.4"
 actor-helper = { git = "https://github.com/rustonbsd/actor-helper", rev="9af542cc2d26354dcc4d87d270408326aa319397", features=["anyhow", "tokio"] }
 clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 noq = { version = "0.17.0" }
+url = "2"
+iroh-relay = "0.97"
 
 #iroh-quinn = { git = "https://github.com/n0-computer/quinn", rev = "315f491bfbdd0bb04fb8cdb43967b40bfef83d22" }
 

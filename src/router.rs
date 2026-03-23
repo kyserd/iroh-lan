@@ -21,6 +21,9 @@ use actor_helper::{Action, Actor, Handle, act, act_ok};
 
 use crate::kv::{Kv, KvEvent};
 
+const CANDIDATE_PHASE_DURATION: Duration = Duration::from_secs(10);
+const VERIFY_IP_DURATION: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct Builder {
     topic_discovery_hook: TopicDiscoveryHook,
@@ -93,7 +96,7 @@ impl Builder {
         let signing_key = SigningKey::from_bytes(&self.secret_key.to_bytes());
         let topic_discovery_config =
             TopicDiscoveryConfig::builder(signing_key, self.topic_discovery_hook.clone())
-                .connection_timeout(Duration::from_secs(15))
+                .connection_timeout(Duration::from_secs(30))
                 .announce_interval(Duration::from_secs(15 * 60))
                 .dht_retries(None)
                 .build();
@@ -554,7 +557,12 @@ impl RouterActor {
     }
 
     // write ip assigned
-    async fn write_ip_assignment(&mut self, ip: Ipv4Addr, endpoint_id: EndpointId) -> Result<()> {
+    async fn write_ip_assignment(
+        &mut self,
+        ip: Ipv4Addr,
+        endpoint_id: EndpointId,
+        force_override: bool,
+    ) -> Result<()> {
         if !self.is_initialized() {
             warn!(
                 "[Kv] write_ip_assignment called before initialized. Startup entries count: {}",
@@ -567,21 +575,28 @@ impl RouterActor {
         let existing_assignment = self.read_ip_assignment(ip, true)?;
 
         if let Some(existing) = &existing_assignment {
-            if existing.endpoint_id != endpoint_id {
+            if existing.endpoint_id != endpoint_id && !force_override {
                 anyhow::bail!("ip already assigned to another node");
             }
         } else {
             // New assignment. check for multiple candidates
             let candidates = self.read_ip_candidates(ip, true)?;
-            if candidates.is_empty() {
-                bail!("no candidates for this ip");
-            }
-
             if candidates
                 .iter()
-                .any(|c| c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id)
+                .filter(|c| if c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id {
+                    debug!(
+                        "Existing candidate {} has higher priority than us for IP {}. Not writing new candidate.",
+                        c.endpoint_id, ip
+                    );
+                    true
+                } else {
+                    false
+                })
+                .count()
+                > 0
+                || !candidates.iter().any(|c| c.endpoint_id == self.endpoint_id)
             {
-                bail!("another candidate with higher endpoint_id exists");
+                bail!("no candidates for this ip");
             }
         }
 
@@ -613,12 +628,27 @@ impl RouterActor {
             bail!("[Kv] not initialized yet");
         }
         // already assigned? don't write
-        if self.read_ip_assignment(ip, true)?.is_some() {
+        if let Some(assignment) = self.read_ip_assignment(ip, true)?
+            && assignment.endpoint_id != endpoint_id
+            && self.endpoint_id < assignment.endpoint_id
+        {
             anyhow::bail!("ip assignment already assigned");
         }
 
         if let Ok(candidates) = self.read_ip_candidates(ip, true)
-            && !candidates.is_empty()
+            && candidates
+                .iter()
+                .filter(|c| if c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id {
+                    debug!(
+                        "Existing candidate {} has higher priority than us for IP {}. Not writing new candidate.",
+                        c.endpoint_id, ip
+                    );
+                    true
+                } else {
+                    false
+                })
+                .count()
+                > 0
         {
             anyhow::bail!("ip candidate already exists");
         }
@@ -681,8 +711,23 @@ impl RouterActor {
                     return Ok(false);
                 }
 
+                if let Ok(Some(assignment)) = self.read_ip_assignment(ip_candidate.ip, true)
+                    && assignment.endpoint_id != self.endpoint_id
+                    && self.endpoint_id < assignment.endpoint_id
+                {
+                    warn!(
+                        "IP {} got assigned to {} during acquisition wait. Aborting.",
+                        ip_candidate.ip, assignment.endpoint_id
+                    );
+                    self.my_ip = RouterIp::NoIp;
+                    return Ok(false);
+                }
+
+                self.write_ip_candidate(ip_candidate.ip, self.endpoint_id)
+                    .await?;
+
                 // Wait at least 5 seconds
-                if elapsed > Duration::from_secs(5) {
+                if elapsed > CANDIDATE_PHASE_DURATION {
                     // Jitter: 20% chance to proceed per tick (approx 500ms)
                     if rand::rng().random_bool(0.2) {
                         info!(
@@ -690,7 +735,7 @@ impl RouterActor {
                             ip_candidate.ip
                         );
                         if self
-                            .write_ip_assignment(ip_candidate.ip, ip_candidate.endpoint_id)
+                            .write_ip_assignment(ip_candidate.ip, ip_candidate.endpoint_id, false)
                             .await
                             .is_ok()
                         {
@@ -713,7 +758,7 @@ impl RouterActor {
             }
             RouterIp::VerifyingIp(ip, start_time) => {
                 // Wait 2 seconds to ensure propagation
-                if start_time.elapsed() > Duration::from_secs(2) {
+                if start_time.elapsed() > VERIFY_IP_DURATION {
                     trace!("Verifying IP assignment logic for {}", ip);
                     let assignment = self.read_ip_assignment(ip, true)?;
                     match assignment {
@@ -736,18 +781,33 @@ impl RouterActor {
                 match self.read_ip_assignment(my_ip, true)? {
                     Some(ip_assignment) => {
                         if ip_assignment.endpoint_id != self.endpoint_id {
-                            self.my_ip = RouterIp::NoIp;
-                            warn!(
-                                "Lost IP assignment for {}. Expected owner: {}, Found: {}. Restarting negotiation.",
-                                my_ip, self.endpoint_id, ip_assignment.endpoint_id
-                            );
-                            Ok(false)
+                            if ip_assignment.endpoint_id < self.endpoint_id {
+                                if current_time().saturating_sub(ip_assignment.last_updated) > 30 {
+                                    info!("Refreshing IP assignment for {}", my_ip);
+                                    if let Err(e) = self
+                                        .write_ip_assignment(my_ip, self.endpoint_id, true)
+                                        .await
+                                    {
+                                        warn!("Failed to refresh IP assignment: {}", e);
+                                        // Don't lose IP immediately, retry next tick
+                                    }
+                                }
+                                Ok(true)
+                            } else {
+                                self.my_ip = RouterIp::NoIp;
+                                warn!(
+                                    "Lost IP assignment for {}. Expected owner: {}, Found: {}. Restarting negotiation.",
+                                    my_ip, self.endpoint_id, ip_assignment.endpoint_id
+                                );
+                                Ok(false)
+                            }
                         } else {
                             // Refresh if needed (every 30s)
                             if current_time().saturating_sub(ip_assignment.last_updated) > 30 {
                                 info!("Refreshing IP assignment for {}", my_ip);
-                                if let Err(e) =
-                                    self.write_ip_assignment(my_ip, self.endpoint_id).await
+                                if let Err(e) = self
+                                    .write_ip_assignment(my_ip, self.endpoint_id, false)
+                                    .await
                                 {
                                     warn!("Failed to refresh IP assignment: {}", e);
                                     // Don't lose IP immediately, retry next tick

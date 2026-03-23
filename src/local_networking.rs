@@ -83,7 +83,7 @@ impl Tun {
         let dev = DeviceBuilder::new()
             .ipv4(ip, 24, None)
             .layer(Layer::L3)
-            .mtu(1280)
+            .mtu(1140)
             .build_async()?;
 
         let (tun_tx, tun_rx) = tokio::sync::mpsc::channel(1024 * 16);
