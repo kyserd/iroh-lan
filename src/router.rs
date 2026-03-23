@@ -98,6 +98,8 @@ impl Builder {
             TopicDiscoveryConfig::builder(signing_key, self.topic_discovery_hook.clone())
                 .connection_timeout(Duration::from_secs(30))
                 .announce_interval(Duration::from_secs(15 * 60))
+                .first_connected_duration(Some(Duration::from_secs(60)))
+                .discovery_interval_first_connected(Duration::from_secs(4))
                 .dht_retries(None)
                 .build();
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
@@ -124,7 +126,7 @@ impl Builder {
             kv,
             _endpoint: endpoint.clone(),
             endpoint_id: endpoint.id(),
-            _topic: topic_handle,
+            topic: topic_handle,
             rx,
             my_ip: RouterIp::NoIp,
             assignments: BTreeMap::new(),
@@ -156,7 +158,7 @@ struct RouterActor {
 
     pub(crate) _endpoint: Endpoint,
     pub endpoint_id: EndpointId,
-    pub(crate) _topic: Option<TopicDiscoveryHandle>,
+    pub(crate) topic: Option<TopicDiscoveryHandle>,
 
     pub my_ip: RouterIp,
 
@@ -698,6 +700,7 @@ impl RouterActor {
             RouterIp::AquiringIp(ip_candidate, start_time) => {
                 let elapsed = start_time.elapsed();
 
+                debug!("RouterIp::AquiringIp: {:?}", self.read_ip_candidates(ip_candidate.ip, true)?);
                 if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip, true)
                     && candidates.iter().any(|c| {
                         c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id
@@ -728,8 +731,23 @@ impl RouterActor {
 
                 // Wait at least 5 seconds
                 if elapsed > CANDIDATE_PHASE_DURATION {
+
                     // Jitter: 20% chance to proceed per tick (approx 500ms)
                     if rand::rng().random_bool(0.2) {
+                        // if we are connected to peers that we don't yet see in any of the candidate records, 
+                        // that leaves the risk of a potential collision, so we wait until we see all currently connected peers in at least one of the candidates
+                        if let Some(peers) = self.topic.as_ref().map(|topic| topic.get_connected_peers()) {
+                            let all_candidates = self.read_all_ip_candidates(true)?;
+                            if peers.iter().all(|p| all_candidates.iter().any(|c| c.endpoint_id == *p)) {
+                                debug!("All connected peers are visible in candidates for IP {}. Proceeding with acquisition.", ip_candidate.ip);
+                            } else {
+                                warn!("Not all connected peers are visible in candidates for IP {}. Waiting longer to avoid potential collision.", ip_candidate.ip);
+                                return Ok(false);
+                            }
+                        } else {
+                            return Ok(false);
+                        }
+                        
                         info!(
                             "Attempting to finalize IP assignment for {}",
                             ip_candidate.ip

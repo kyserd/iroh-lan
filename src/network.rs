@@ -136,7 +136,7 @@ impl Network {
         relay_map.extend(&iroh::defaults::prod::default_relay_map());
 
         let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .relay_mode(iroh::RelayMode::Custom(relay_map))
+            //.relay_mode(iroh::RelayMode::Custom(relay_map))
             .hooks(auth.clone())
             .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())

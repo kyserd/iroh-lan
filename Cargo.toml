@@ -13,9 +13,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="89f3ab5025242c8cf689b63387a1d1579da2bb7d" }
+iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="1d1c9f0ed30066484aa839c56e735874bc821efd" }
 ed25519-dalek = "3.0.0-pre.1"
-iroh = { version="0.97", features=["qlog"] }
+iroh = { version="0.97", features=["address-lookup-pkarr-dht", "qlog"] }
 iroh-gossip = "0.97.0"
 runas = "1"
 tokio = "1"
@@ -36,7 +36,7 @@ chrono = { version = "0.4" }
 n0-watcher = "0.6"
 
 #iroh-auth = { version = "0.1.2" }
-iroh-auth = { path="../iroh-auth" } #"0.1.4"
+iroh-auth = { git="https://github.com/rustonbsd/iroh-auth", rev="36cb05716c1863f9949602bce23a7e06990064fc" }
 actor-helper = { git = "https://github.com/rustonbsd/actor-helper", rev="9af542cc2d26354dcc4d87d270408326aa319397", features=["anyhow", "tokio"] }
 clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30.0"

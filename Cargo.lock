@@ -167,6 +167,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compat"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1ba85bc55464dcbf728b56d97e119d673f4cf9062be330a9a26f3acf504a590"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "once_cell",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2097,8 +2110,8 @@ dependencies = [
 [[package]]
 name = "iroh-auth"
 version = "0.1.4"
+source = "git+https://github.com/rustonbsd/iroh-auth?rev=36cb05716c1863f9949602bce23a7e06990064fc#36cb05716c1863f9949602bce23a7e06990064fc"
 dependencies = [
- "bytes",
  "hkdf",
  "iroh",
  "n0-future",
@@ -2275,7 +2288,7 @@ dependencies = [
 [[package]]
 name = "iroh-topic-tracker"
 version = "0.2.0"
-source = "git+https://github.com/rustonbsd/iroh-topic-tracker?rev=89f3ab5025242c8cf689b63387a1d1579da2bb7d#89f3ab5025242c8cf689b63387a1d1579da2bb7d"
+source = "git+https://github.com/rustonbsd/iroh-topic-tracker?rev=1d1c9f0ed30066484aa839c56e735874bc821efd#1d1c9f0ed30066484aa839c56e735874bc821efd"
 dependencies = [
  "actor-helper 0.2.1",
  "anyhow",
@@ -2525,6 +2538,28 @@ checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
  "nix 0.29.0",
  "winapi",
+]
+
+[[package]]
+name = "mainline"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ff27d378ca495eaf3be8616d5d7319c1c18e93fd60e13698fcdc7e19448f1a4"
+dependencies = [
+ "crc",
+ "document-features",
+ "dyn-clone",
+ "ed25519-dalek",
+ "flume 0.11.1",
+ "futures-lite",
+ "getrandom 0.3.4",
+ "lru 0.16.3",
+ "serde",
+ "serde_bencode",
+ "serde_bytes",
+ "sha1_smol",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -3339,17 +3374,30 @@ version = "5.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d346b545765a0ef58b6a7e160e17ddaa7427f439b7b9a287df6c88c9e04bf2"
 dependencies = [
+ "async-compat",
  "base32",
  "bytes",
  "cfg_aliases",
  "document-features",
+ "dyn-clone",
  "ed25519-dalek",
+ "futures-buffered",
+ "futures-lite",
  "getrandom 0.3.4",
+ "log",
+ "lru 0.16.3",
+ "mainline",
  "ntimestamp",
+ "reqwest",
  "self_cell",
  "serde",
+ "sha1_smol",
  "simple-dns",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
