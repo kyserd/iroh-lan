@@ -126,12 +126,6 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2.0.0'
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.platform.target }}-tauri
-          workspaces: ui/src-tauri
-
       - name: Install frontend dependencies
         working-directory: ui
         run: pnpm install
