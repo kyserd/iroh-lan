@@ -16,7 +16,7 @@ use std::{
 use tracing::{info, trace, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 
-use actor_helper::{Action, Actor, Handle, act};
+use actor_helper::{Action, Handle, Receiver, act};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Ipv4Pkg(Vec<u8>);
@@ -56,7 +56,6 @@ pub struct Tun {
 struct TunActor {
     ip: Ipv4Addr,
     dev: AsyncDevice,
-    rx: actor_helper::Receiver<Action<TunActor>>,
     tun_rx: tokio::sync::mpsc::Receiver<Ipv4Pkg>,
     to_remote_writer: tokio::sync::mpsc::Sender<Ipv4Pkg>,
 }
@@ -87,13 +86,12 @@ impl Tun {
             .build_async()?;
 
         let (tun_tx, tun_rx) = tokio::sync::mpsc::channel(1024 * 16);
-        let (api, _) = Handle::spawn(|rx| TunActor {
+        let (api, _) = Handle::spawn_with(TunActor {
                 ip,
                 to_remote_writer: to_remote_writer.clone(),
                 dev,
-                rx,
                 tun_rx,
-            });
+            }, |mut actor, rx| async move {actor.run(rx).await} );
         Ok(Self { api, tun_tx })
     }
 
@@ -121,13 +119,13 @@ impl Tun {
     }
 }
 
-impl Actor<anyhow::Error> for TunActor {
-    async fn run(&mut self) -> Result<()> {
+impl TunActor {
+    async fn run(&mut self, rx: Receiver<Action<TunActor>>) -> Result<()> {
         let mut dev_buf = [0u8; 1024 * 128];
         info!("TunActor started for IP: {}", self.ip);
         loop {
             tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
+                Ok(action) = rx.recv_async() => {
                     action(self).await;
                 }
 

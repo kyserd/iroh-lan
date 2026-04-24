@@ -1,13 +1,10 @@
-use actor_helper::{Action, Actor, Handle, act, act_ok};
+use actor_helper::{Action, Handle, Receiver, act, act_ok};
 use anyhow::Result;
 use iroh::{Endpoint, EndpointId, endpoint::Connection, protocol::ProtocolHandler};
 use n0_watcher::Watchable;
 use noq::VarInt;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    time::Duration,
-};
+use std::collections::{HashMap, hash_map::Entry};
 use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
@@ -52,7 +49,6 @@ impl Default for ConnGen {
 struct DirectActor {
     peers: HashMap<EndpointId, ConnGen>,
     endpoint: iroh::endpoint::Endpoint,
-    rx: actor_helper::Receiver<Action<DirectActor>>,
     direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     router: Option<Router>,
 }
@@ -69,12 +65,13 @@ impl Direct {
         endpoint: iroh::endpoint::Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     ) -> Self {
-        let (api, _) = Handle::spawn(|rx| DirectActor {
+        let (api, _) = Handle::spawn_with(DirectActor {
             peers: HashMap::new(),
             endpoint,
-            rx,
             direct_connect_tx,
             router: None,
+        }, |mut actor, rx| async move {
+            actor.run(rx).await
         });
         Self { api }
     }
@@ -121,8 +118,8 @@ impl Direct {
     }
 }
 
-impl Actor<anyhow::Error> for DirectActor {
-    async fn run(&mut self) -> Result<(), anyhow::Error> {
+impl DirectActor {
+    async fn run(&mut self, rx: Receiver<Action<DirectActor>>) -> Result<(), anyhow::Error> {
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -132,7 +129,7 @@ impl Actor<anyhow::Error> for DirectActor {
         debug!("DirectActor run loop started");
         loop {
             tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
+                Ok(action) = rx.recv_async() => {
                     action(self).await;
                 }
                 _ = cleanup_interval.tick() => {

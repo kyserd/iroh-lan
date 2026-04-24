@@ -17,7 +17,7 @@ use tracing::{debug, info, trace, warn};
 use anyhow::{Result, bail};
 use iroh::{Endpoint, EndpointId, SecretKey};
 
-use actor_helper::{Action, Actor, Handle, act, act_ok};
+use actor_helper::{Action, Handle, Receiver, act, act_ok};
 
 use crate::kv::{Kv, KvEvent};
 
@@ -39,7 +39,7 @@ impl Builder {
         Builder {
             topic_discovery_hook,
             entry_name: String::default(),
-            secret_key: SecretKey::generate(&mut rand::rng()),
+            secret_key: SecretKey::generate(),
             password: String::default(),
             endpoint: None,
             gossip: None,
@@ -122,17 +122,19 @@ impl Builder {
 
         let kv = Kv::spawn(endpoint.id(), gossip_sender, gossip_receiver);
 
-        let (api, _) = Handle::spawn(|rx| RouterActor {
-            kv,
-            _endpoint: endpoint.clone(),
-            endpoint_id: endpoint.id(),
-            topic: topic_handle,
-            rx,
-            my_ip: RouterIp::NoIp,
-            assignments: BTreeMap::new(),
-            candidates: BTreeMap::new(),
-            startup_entries: BTreeSet::new(),
-        });
+        let (api, _) = Handle::spawn_with(
+            RouterActor {
+                kv,
+                _endpoint: endpoint.clone(),
+                endpoint_id: endpoint.id(),
+                topic: topic_handle,
+                my_ip: RouterIp::NoIp,
+                assignments: BTreeMap::new(),
+                candidates: BTreeMap::new(),
+                startup_entries: BTreeSet::new(),
+            },
+            |mut actor, rx| async move { actor.run(rx).await },
+        );
         Ok(Router { api })
     }
 }
@@ -152,8 +154,6 @@ pub enum RouterIp {
 
 #[derive(Debug)]
 struct RouterActor {
-    pub(crate) rx: actor_helper::Receiver<Action<RouterActor>>,
-
     pub kv: Kv,
 
     pub(crate) _endpoint: Endpoint,
@@ -223,8 +223,8 @@ impl Router {
     }
 }
 
-impl Actor<anyhow::Error> for RouterActor {
-    async fn run(&mut self) -> Result<()> {
+impl RouterActor {
+    async fn run(&mut self, rx: Receiver<Action<RouterActor>>) -> Result<()> {
         let mut ip_tick = tokio::time::interval(Duration::from_millis(1000));
         ip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -237,7 +237,7 @@ impl Actor<anyhow::Error> for RouterActor {
 
         loop {
             tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
+                Ok(action) = rx.recv_async() => {
                     action(self).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -691,6 +691,14 @@ impl RouterActor {
                 let next_ip = self.get_next_ip().await?;
                 info!("Trying to acquire IP candidate: {}", next_ip);
 
+                if self.read_ip_assignment(next_ip, true)?.is_some() {
+                    debug!(
+                        "IP {} already assigned to another node. Skipping candidate write.",
+                        next_ip
+                    );
+                    return Ok(false);
+                }
+
                 self.my_ip = RouterIp::AquiringIp(
                     self.write_ip_candidate(next_ip, self.endpoint_id).await?,
                     tokio::time::Instant::now(),
@@ -700,10 +708,17 @@ impl RouterActor {
             RouterIp::AquiringIp(ip_candidate, start_time) => {
                 let elapsed = start_time.elapsed();
 
-                debug!("RouterIp::AquiringIp: {:?}", self.read_ip_candidates(ip_candidate.ip, true)?);
+                debug!(
+                    "RouterIp::AquiringIp: {:?}",
+                    self.read_ip_candidates(ip_candidate.ip, true)?
+                );
                 if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip, true)
                     && candidates.iter().any(|c| {
-                        c.endpoint_id != self.endpoint_id && self.endpoint_id < c.endpoint_id
+                        c.endpoint_id != self.endpoint_id
+                            && (self.endpoint_id < c.endpoint_id
+                                || (self.endpoint_id >= c.endpoint_id
+                                    && current_time().saturating_sub(c.last_updated)
+                                        > CANDIDATE_PHASE_DURATION.as_secs()))
                     })
                 {
                     warn!(
@@ -716,7 +731,10 @@ impl RouterActor {
 
                 if let Ok(Some(assignment)) = self.read_ip_assignment(ip_candidate.ip, true)
                     && assignment.endpoint_id != self.endpoint_id
-                    && self.endpoint_id < assignment.endpoint_id
+                    && (self.endpoint_id < assignment.endpoint_id
+                        || (self.endpoint_id >= assignment.endpoint_id
+                            && current_time().saturating_sub(assignment.last_updated)
+                                > VERIFY_IP_DURATION.as_secs()))
                 {
                     warn!(
                         "IP {} got assigned to {} during acquisition wait. Aborting.",
@@ -731,23 +749,33 @@ impl RouterActor {
 
                 // Wait at least 5 seconds
                 if elapsed > CANDIDATE_PHASE_DURATION {
-
                     // Jitter: 20% chance to proceed per tick (approx 500ms)
                     if rand::rng().random_bool(0.2) {
-                        // if we are connected to peers that we don't yet see in any of the candidate records, 
+                        // if we are connected to peers that we don't yet see in any of the candidate records,
                         // that leaves the risk of a potential collision, so we wait until we see all currently connected peers in at least one of the candidates
-                        if let Some(peers) = self.topic.as_ref().map(|topic| topic.get_connected_peers()) {
+                        if let Some(peers) =
+                            self.topic.as_ref().map(|topic| topic.get_connected_peers())
+                        {
                             let all_candidates = self.read_all_ip_candidates(true)?;
-                            if peers.iter().all(|p| all_candidates.iter().any(|c| c.endpoint_id == *p)) {
-                                debug!("All connected peers are visible in candidates for IP {}. Proceeding with acquisition.", ip_candidate.ip);
+                            if peers
+                                .iter()
+                                .all(|p| all_candidates.iter().any(|c| c.endpoint_id == *p))
+                            {
+                                debug!(
+                                    "All connected peers are visible in candidates for IP {}. Proceeding with acquisition.",
+                                    ip_candidate.ip
+                                );
                             } else {
-                                warn!("Not all connected peers are visible in candidates for IP {}. Waiting longer to avoid potential collision.", ip_candidate.ip);
+                                warn!(
+                                    "Not all connected peers are visible in candidates for IP {}. Waiting longer to avoid potential collision.",
+                                    ip_candidate.ip
+                                );
                                 return Ok(false);
                             }
                         } else {
                             return Ok(false);
                         }
-                        
+
                         info!(
                             "Attempting to finalize IP assignment for {}",
                             ip_candidate.ip

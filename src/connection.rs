@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
 use crate::DirectMessage;
-use actor_helper::{Action, Actor, ActorState, Handle, Receiver, act, act_ok};
+use actor_helper::{Action, ActorState, Handle, Receiver, act, act_ok};
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::endpoint::{Connection, VarInt};
@@ -39,7 +39,6 @@ pub enum ConnState {
 
 #[derive(Debug)]
 struct ConnActor {
-    rx: Receiver<Action<ConnActor>>,
     self_handle: Option<Handle<ConnActor, anyhow::Error>>,
     state: Watchable<ConnState>,
 
@@ -72,7 +71,10 @@ impl Conn {
         conn: iroh::endpoint::Connection,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
     ) -> Result<Self> {
-        let (api, _) = Handle::spawn(|rx| ConnActor::new(rx, external_sender, conn.remote_id()));
+        let (api, _) = Handle::spawn_with(
+            ConnActor::new(external_sender, conn.remote_id()),
+            |mut actor, rx| async move { actor.run(rx).await },
+        );
         let s = Self { api };
         let self_handle = s.api.clone();
         s.api
@@ -82,15 +84,13 @@ impl Conn {
             }))
             .await?;
 
+        /*
         if let Err(err) = handshake(conn.clone(), CONNECTING_TIMEOUT).await {
-            warn!(
-                "Handshake failed for {}: {}",
-                conn.remote_id(),
-                err
-            );
+            warn!("Handshake failed for {}: {}", conn.remote_id(), err);
             s.drop().await;
             anyhow::bail!("Handshake failed: {}", err);
         }
+        */
 
         if let Err(err) = s.establish_connection(conn.clone()).await {
             warn!(
@@ -110,7 +110,10 @@ impl Conn {
         remote_endpoint_id: EndpointId,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
     ) -> Result<Self> {
-        let (api, _) = Handle::spawn(|rx| ConnActor::new(rx, external_sender, remote_endpoint_id));
+        let (api, _) = Handle::spawn_with(
+            ConnActor::new(external_sender, remote_endpoint_id),
+            |mut actor, rx| async move { actor.run(rx).await },
+        );
         let s = Self { api };
         let self_handle = s.api.clone();
         s.api
@@ -128,7 +131,10 @@ impl Conn {
         {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
-                warn!("Initial connection to {} failed: {:?}", remote_endpoint_id, e);
+                warn!(
+                    "Initial connection to {} failed: {:?}",
+                    remote_endpoint_id, e
+                );
                 s.drop().await;
                 anyhow::bail!("Failed to establish connection: {}: {:?}", e, e);
             }
@@ -143,15 +149,13 @@ impl Conn {
             }
         };
 
+        /*
         if let Err(err) = handshake(conn.clone(), CONNECTING_TIMEOUT).await {
-            warn!(
-                "Handshake failed for {}: {:?}",
-                conn.remote_id(),
-                err
-            );
+            warn!("Handshake failed for {}: {:?}", conn.remote_id(), err);
             s.drop().await;
             anyhow::bail!("Handshake failed: {}", err);
         }
+        */
 
         if let Err(err) = s.establish_connection(conn).await {
             warn!(
@@ -213,7 +217,8 @@ impl Conn {
     }
 }
 
-async fn handshake(conn: Connection, timeout: Duration) -> Result<()> {
+#[allow(dead_code)]
+async fn handshake(conn: Connection, handshake_timeout: Duration) -> Result<()> {
     let handshake_task = async {
         let (mut send, mut recv) = if conn.side() == iroh::endpoint::Side::Client {
             conn.open_bi().await?
@@ -221,22 +226,31 @@ async fn handshake(conn: Connection, timeout: Duration) -> Result<()> {
             conn.accept_bi().await?
         };
         let mut buf = [0u8; 1];
-        info!("Performing connection handshake for #1: {}",conn.remote_id());
+        info!(
+            "Performing connection handshake for #1: {}",
+            conn.remote_id()
+        );
         send.write_all(&buf).await?;
         send.finish()?;
 
-        info!("Performing connection handshake for #2: {}",conn.remote_id());
+        info!(
+            "Performing connection handshake for #2: {}",
+            conn.remote_id()
+        );
         recv.read_exact(&mut buf).await?;
         recv.read_to_end(usize::MAX).await?;
-        info!("Performing connection handshake for #3: {}",conn.remote_id());
+        info!(
+            "Performing connection handshake for #3: {}",
+            conn.remote_id()
+        );
         Ok(())
     };
 
-    tokio::time::timeout(timeout, handshake_task).await?
+    tokio::time::timeout(handshake_timeout, handshake_task).await?
 }
 
-impl Actor<anyhow::Error> for ConnActor {
-    async fn run(&mut self) -> Result<()> {
+impl ConnActor {
+    async fn run(&mut self, rx: Receiver<Action<ConnActor>>) -> Result<()> {
         //let mut reconnect_ticker = tokio::time::interval(Duration::from_millis(500));
         //reconnect_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -257,7 +271,7 @@ impl Actor<anyhow::Error> for ConnActor {
                 break;
             }
             tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
+                Ok(action) = rx.recv_async() => {
                     action(self).await;
                 }
                 /*_ = reconnect_ticker.tick(), if self.state != ConnState::Closed => {
@@ -327,12 +341,10 @@ impl Actor<anyhow::Error> for ConnActor {
 impl ConnActor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        rx: Receiver<Action<ConnActor>>,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
         conn_endpoint_id: EndpointId,
     ) -> Self {
         Self {
-            rx,
             state: Watchable::new(ConnState::Connecting),
             external_sender,
             read_task: None,

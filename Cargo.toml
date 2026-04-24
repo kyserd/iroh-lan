@@ -13,10 +13,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="1d1c9f0ed30066484aa839c56e735874bc821efd" }
-ed25519-dalek = "3.0.0-pre.1"
-iroh = { version="0.97", features=["address-lookup-pkarr-dht", "qlog"] }
-iroh-gossip = "0.97.0"
+iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="58320f1d3e6c46cc0e6bfce9e1c8f0f79a92a94a" }
+ed25519-dalek = "3.0.0-pre.6"
+iroh = { version="0.98.1", features=["address-lookup-pkarr-dht", "qlog", "tls-ring"] }
+iroh-gossip = "0.98.0"
 runas = "1"
 tokio = "1"
 nix = { version = "0.31", features = ["process"] }
@@ -35,25 +35,14 @@ bytes = "1"
 chrono = { version = "0.4" }
 n0-watcher = "0.6"
 
-#iroh-auth = { version = "0.1.2" }
-iroh-auth = { git="https://github.com/rustonbsd/iroh-auth", rev="36cb05716c1863f9949602bce23a7e06990064fc" }
-actor-helper = { git = "https://github.com/rustonbsd/actor-helper", rev="9af542cc2d26354dcc4d87d270408326aa319397", features=["anyhow", "tokio"] }
+iroh-auth = { git="https://github.com/rustonbsd/iroh-auth", rev="70c7bca92bae179212fe6088105ca3025490fff4" }
+actor-helper = { version="0.3.0", features=["anyhow", "tokio"]} #{ git = "https://github.com/rustonbsd/actor-helper", rev="9af542cc2d26354dcc4d87d270408326aa319397", features=["anyhow", "tokio"] }
 clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
-noq = { version = "0.17.0" }
+noq = { version = "0.18" }
 url = "2"
-iroh-relay = "0.97"
-
-#iroh-quinn = { git = "https://github.com/n0-computer/quinn", rev = "315f491bfbdd0bb04fb8cdb43967b40bfef83d22" }
-
-#iroh = { git = "https://github.com/n0-computer/iroh", rev = "7fc9fb93e2d30badb95a87e2406f225ea73b8b48" }
-#iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "7fc9fb93e2d30badb95a87e2406f225ea73b8b48" }
-#iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "7fc9fb93e2d30badb95a87e2406f225ea73b8b48" }
-#iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "5f0e768e25e581064027188e6913891da441cd16" }
-#noq = { git="https://github.com/n0-computer/noq", rev="8adda44486fdf33f08ae7481b2c3b3a4db587548", package = "noq" }
-#noq-proto = { git="https://github.com/n0-computer/noq", rev="8adda44486fdf33f08ae7481b2c3b3a4db587548", package = "noq-proto" }
-#noq-udp = { git="https://github.com/n0-computer/noq", rev="8adda44486fdf33f08ae7481b2c3b3a4db587548", package = "noq-udp" }#
+iroh-relay = "0.98"
 
 [lib]
 path = "src/lib.rs"
@@ -71,7 +60,3 @@ crate-type = ["bin"]
 
 
 [patch.crates-io]
-#iroh = { git = "https://github.com/n0-computer/iroh.git", branch = "main" }
-#iroh-base = { git = "https://github.com/n0-computer/iroh.git", branch = "main" }
-#irpc = { git = "https://github.com/n0-computer/irpc.git", branch = "feat-noq" }
-#iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip.git", rev="5f0e768e25e581064027188e6913891da441cd16" }

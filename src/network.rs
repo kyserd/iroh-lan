@@ -4,19 +4,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use actor_helper::{Action, Actor, Handle, act, act_ok};
+use actor_helper::{Action, Handle, Receiver, act, act_ok};
 use anyhow::Result;
 use iroh::{
-    Endpoint, EndpointId, RelayConfig, RelayMap, SecretKey, endpoint::{Connection, IdleTimeout, QuicTransportConfig, VarInt}, protocol::ProtocolHandler
+    Endpoint, EndpointId, SecretKey, endpoint::{Connection, IdleTimeout, QuicTransportConfig, VarInt}, protocol::ProtocolHandler
 };
 use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
-use iroh_relay::RelayQuicConfig;
 use iroh_topic_tracker::TopicDiscoveryHook;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
-use url::Url;
 
 use crate::{
     ConnState, Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp,
@@ -32,8 +30,6 @@ pub struct Network {
 
 #[derive(Debug)]
 struct NetworkActor {
-    rx: actor_helper::Receiver<Action<NetworkActor>>,
-
     router: Router,
     direct: Direct,
     _auth: Authenticator,
@@ -96,6 +92,7 @@ fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
     transport.build()
 }
 
+/*
 fn rustonbsd_relay() -> RelayConfig {
     let url: Url = format!("https://iroh-relay.rustonbsd.com/")
         .parse()
@@ -104,7 +101,7 @@ fn rustonbsd_relay() -> RelayConfig {
         url: url.into(),
         quic: Some(RelayQuicConfig::default()),
     }
-}
+} */
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -123,7 +120,7 @@ impl Network {
         password: &str,
         log_dir: Option<PathBuf>,
     ) -> Result<Self> {
-        let secret_key = SecretKey::generate(&mut rand::rng());
+        let secret_key = SecretKey::generate();
 
         let mut network_secret = sha2::Sha512::new();
         network_secret.update(format!("iroh-lan-network-name-{}", name));
@@ -132,8 +129,8 @@ impl Network {
 
         let auth = Authenticator::new(&network_secret);
         let topic_discovery_hook = TopicDiscoveryHook::new();
-        let relay_map = RelayMap::from_iter([rustonbsd_relay()]);
-        relay_map.extend(&iroh::defaults::prod::default_relay_map());
+        //let relay_map = RelayMap::from_iter([rustonbsd_relay()]);
+        //relay_map.extend(&iroh::defaults::prod::default_relay_map());
 
         let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             //.relay_mode(iroh::RelayMode::Custom(relay_map))
@@ -143,7 +140,8 @@ impl Network {
             .transport_config(transport_config(log_dir))
             .bind()
             .await?;
-        auth.set_endpoint(&endpoint);
+        auth.set_endpoint(&endpoint).await;
+        endpoint.online().await;
 
         let gossip_hyparview_config = HyparviewConfig {
             neighbor_request_timeout: Duration::from_millis(3000),
@@ -187,8 +185,7 @@ impl Network {
         direct.set_router(router.clone()).await?;
 
         let (to_remote_writer, to_remote_reader) = tokio::sync::mpsc::channel(1024 * 16);
-        let (api, _) = Handle::spawn(|rx| NetworkActor {
-            rx,
+        let (api, _) = Handle::spawn_with(NetworkActor {
             router,
             direct,
             _auth: auth,
@@ -207,7 +204,7 @@ impl Network {
             ip_cache: HashMap::new(),
             peer_ids: HashSet::new(),
             pending_packets: HashMap::new(),
-        });
+        }, |mut actor, rx| async move { actor.run(rx).await });
 
         Ok(Self { api })
     }
@@ -253,8 +250,8 @@ impl Network {
     }
 }
 
-impl Actor<anyhow::Error> for NetworkActor {
-    async fn run(&mut self) -> Result<()> {
+impl NetworkActor {
+    async fn run(&mut self, rx: Receiver<Action<NetworkActor>>) -> Result<()> {
         let mut ip_tick = tokio::time::interval(Duration::from_millis(500));
         ip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -265,7 +262,7 @@ impl Actor<anyhow::Error> for NetworkActor {
 
         loop {
             tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
+                Ok(action) = rx.recv_async() => {
                    trace!("NetworkActor action received");
                     action(self).await;
                 }
