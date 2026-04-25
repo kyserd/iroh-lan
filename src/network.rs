@@ -75,8 +75,8 @@ fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
         .stream_receive_window(STREAM_RWND.into())
         .send_window((4 * STREAM_RWND).into())
         .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
-        .initial_mtu(1400)
-        .min_mtu(1400)
+        .initial_mtu(1660)
+        .min_mtu(1660)
         .datagram_receive_buffer_size(Some(65_536))
         .datagram_send_buffer_size(65_536);
 

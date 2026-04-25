@@ -164,7 +164,6 @@ impl DirectActor {
     } */
 
     async fn connection_driver(&mut self) {
-        println!("conn_driver_tick");
         for (id, peer) in self.peers.clone() {
             if peer.attempts.get() > MAX_RECONNECT_ATTEMPTS {
                 if let Some(stale_conn) = peer.conn.get()
