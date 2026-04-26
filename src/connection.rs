@@ -34,6 +34,7 @@ pub enum InnerConnState {
 #[derive(Debug, Clone)]
 pub struct Conn {
     api: Handle<ConnActor, anyhow::Error>,
+    id: u64,
     conn_state: Arc<Mutex<InnerConnState>>,
     last_keep_alive: Arc<Mutex<Instant>>,
 }
@@ -42,7 +43,7 @@ impl Eq for Conn {}
 
 impl PartialEq for Conn {
     fn eq(&self, other: &Self) -> bool {
-        self.api == other.api
+        self.id == other.id
     }
 }
 
@@ -108,6 +109,7 @@ impl Conn {
             |mut actor, rx| async move { actor.run(rx).await },
         );
         let s = Self {
+            id: rand::random(),
             api,
             conn_state,
             last_keep_alive,
@@ -150,6 +152,7 @@ impl Conn {
             |mut actor, rx| async move { actor.run(rx).await },
         );
         let s = Self {
+            id: rand::random(),
             api,
             conn_state,
             last_keep_alive,
@@ -563,9 +566,9 @@ async fn write_loop_bounded(
         buf.extend_from_slice(&bytes);
 
         let mut retries = 0;
-        while retries < 2 {
+        while retries < 1 {
             match time::timeout(
-                KEEPALIVE_INTERVAL * 2,
+                KEEPALIVE_INTERVAL * 5,
                 conn.send_datagram_wait(Bytes::from(buf.clone())),
             )
             .await
@@ -585,9 +588,9 @@ async fn write_loop_bounded(
             }
         }
 
-        if retries >= 2 {
+        if retries >= 1 {
             warn!(
-                "Write failed after 2 retries, dropping connection: peer_id: {}",
+                "Write failed after 1 retries, dropping connection: peer_id: {}",
                 if let Ok(peer_id) = api
                     .call(act_ok!(actor => async move { actor.conn_endpoint_id }))
                     .await
@@ -615,8 +618,8 @@ async fn retry_read_loop(
 ) {
     info!("Read task started");
     let mut retries = 0;
-    while retries < 2 {
-        match tokio::time::timeout(KEEPALIVE_INTERVAL * 2, read_next_msg(&conn)).await {
+    while retries < 1 {
+        match tokio::time::timeout(KEEPALIVE_INTERVAL * 5000, read_next_msg(&conn)).await {
             Ok(Ok(msg)) => {
                 retries = 0;
                 rx_count.fetch_add(1, Ordering::SeqCst);
@@ -656,9 +659,9 @@ async fn retry_read_loop(
     }
 
     info!("Read task stopped");
-    if retries >= 2 {
+    if retries >= 1 {
         warn!(
-            "Read failed after 2 retries, dropping connection: peer_id: {}",
+            "Read failed after 1 retries, dropping connection: peer_id: {}",
             if let Ok(peer_id) = api
                 .call(act_ok!(actor => async move { actor.conn_endpoint_id }))
                 .await
