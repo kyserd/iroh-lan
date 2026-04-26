@@ -2127,7 +2127,7 @@ dependencies = [
 [[package]]
 name = "iroh-auth"
 version = "0.2.0-pre.1"
-source = "git+https://github.com/rustonbsd/iroh-auth?rev=70c7bca92bae179212fe6088105ca3025490fff4#70c7bca92bae179212fe6088105ca3025490fff4"
+source = "git+https://github.com/rustonbsd/iroh-auth?rev=572b662c675c821945538e66e020801408960b48#572b662c675c821945538e66e020801408960b48"
 dependencies = [
  "hkdf",
  "iroh",
@@ -2323,7 +2323,7 @@ dependencies = [
 [[package]]
 name = "iroh-topic-tracker"
 version = "0.2.0"
-source = "git+https://github.com/rustonbsd/iroh-topic-tracker?rev=58320f1d3e6c46cc0e6bfce9e1c8f0f79a92a94a#58320f1d3e6c46cc0e6bfce9e1c8f0f79a92a94a"
+source = "git+https://github.com/rustonbsd/iroh-topic-tracker?rev=6c491a161c40d07a0e4613d0f68924c1fef7d2c4#6c491a161c40d07a0e4613d0f68924c1fef7d2c4"
 dependencies = [
  "anyhow",
  "bytes",

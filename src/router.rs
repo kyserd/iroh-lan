@@ -4,10 +4,9 @@ use std::{
     time::Duration,
 };
 
-use ed25519_dalek::SigningKey;
 use iroh_gossip::net::Gossip;
 use iroh_topic_tracker::{
-    TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle, TopicDiscoveryHook,
+    TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,7 @@ use sha2::Digest;
 use tracing::{debug, info, trace, warn};
 
 use anyhow::{Result, bail};
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointId};
 
 use actor_helper::{Action, Handle, Receiver, act, act_ok};
 
@@ -24,35 +23,17 @@ use crate::kv::{Kv, KvEvent};
 const CANDIDATE_PHASE_DURATION: Duration = Duration::from_secs(10);
 const VERIFY_IP_DURATION: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Builder {
-    topic_discovery_hook: TopicDiscoveryHook,
     entry_name: String,
-    secret_key: SecretKey,
     password: String,
     endpoint: Option<Endpoint>,
     gossip: Option<Gossip>,
 }
 
 impl Builder {
-    pub fn new(topic_discovery_hook: TopicDiscoveryHook) -> Builder {
-        Builder {
-            topic_discovery_hook,
-            entry_name: String::default(),
-            secret_key: SecretKey::generate(),
-            password: String::default(),
-            endpoint: None,
-            gossip: None,
-        }
-    }
-
     pub fn entry_name(mut self, entry_name: &str) -> Self {
         self.entry_name = entry_name.to_string();
-        self
-    }
-
-    pub fn secret_key(mut self, secret_key: SecretKey) -> Self {
-        self.secret_key = secret_key;
         self
     }
 
@@ -93,9 +74,8 @@ impl Builder {
         topic_hasher.update(&secret_initials);
         let topic_hash: [u8; 32] = topic_hasher.finalize()[..32].try_into()?;
 
-        let signing_key = SigningKey::from_bytes(&self.secret_key.to_bytes());
         let topic_discovery_config =
-            TopicDiscoveryConfig::builder(signing_key, self.topic_discovery_hook.clone())
+            TopicDiscoveryConfig::builder(endpoint.clone())
                 .connection_timeout(Duration::from_secs(30))
                 .announce_interval(Duration::from_secs(15 * 60))
                 .first_connected_duration(Some(Duration::from_secs(60)))
@@ -168,8 +148,8 @@ struct RouterActor {
 }
 
 impl Router {
-    pub fn builder(topic_discovery_hook: TopicDiscoveryHook) -> Builder {
-        Builder::new(topic_discovery_hook)
+    pub fn builder() -> Builder {
+        Builder::default()
     }
 
     pub async fn get_ip_state(&self) -> Result<RouterIp> {
@@ -754,10 +734,11 @@ impl RouterActor {
                         // if we are connected to peers that we don't yet see in any of the candidate records,
                         // that leaves the risk of a potential collision, so we wait until we see all currently connected peers in at least one of the candidates
                         if let Some(peers) =
-                            self.topic.as_ref().map(|topic| topic.get_connected_peers())
+                            self.topic.as_ref().map(|topic| topic.added_neighbors())
                         {
                             let all_candidates = self.read_all_ip_candidates(true)?;
                             if peers
+                                .await
                                 .iter()
                                 .all(|p| all_candidates.iter().any(|c| c.endpoint_id == *p))
                             {

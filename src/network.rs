@@ -7,17 +7,22 @@ use std::{
 use actor_helper::{Action, Handle, Receiver, act, act_ok};
 use anyhow::Result;
 use iroh::{
-    Endpoint, EndpointId, SecretKey, endpoint::{Connection, IdleTimeout, QuicTransportConfig, VarInt}, protocol::ProtocolHandler
+    Endpoint, EndpointId, SecretKey,
+    endpoint::{
+        Connection, IdleTimeout, QuicTransportConfig, VarInt,
+        transports::{AddrKind, TransportBias},
+    },
+    protocol::ProtocolHandler,
 };
 use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
-use iroh_topic_tracker::TopicDiscoveryHook;
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    ConnState, Direct, DirectMessage, Router, Tun, local_networking::Ipv4Pkg, router::RouterIp,
+    Direct, DirectMessage, Router, Tun, connection::InnerConnState, local_networking::Ipv4Pkg,
+    router::RouterIp,
 };
 
 const PENDING_TTL: Duration = Duration::from_secs(60);
@@ -63,7 +68,7 @@ struct NetworkActor {
 fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
     const EXPECTED_RTT: u32 = 100;
     //const MAX_STREAM_BANDWIDTH: u32 = 512_000;
-    const STREAM_RWND: u32 = 102_400;//MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
+    const STREAM_RWND: u32 = 102_400; //MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
 
     let mut transport = QuicTransportConfig::builder()
         //.congestion_controller_factory(Arc::new(BbrConfig::default()))
@@ -128,16 +133,19 @@ impl Network {
         let network_secret: [u8; 64] = network_secret.finalize().into();
 
         let auth = Authenticator::new(&network_secret);
-        let topic_discovery_hook = TopicDiscoveryHook::new();
         //let relay_map = RelayMap::from_iter([rustonbsd_relay()]);
         //relay_map.extend(&iroh::defaults::prod::default_relay_map());
 
         let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             //.relay_mode(iroh::RelayMode::Custom(relay_map))
             .hooks(auth.clone())
-            .hooks(topic_discovery_hook.clone())
             .secret_key(secret_key.clone())
             .transport_config(transport_config(log_dir))
+            .transport_bias(
+                AddrKind::Relay,
+                TransportBias::primary() // → PathStatus::Available -> keep-alive pings
+                    .with_rtt_disadvantage(Duration::from_millis(500)), // direct still wins selection
+            )
             .bind()
             .await?;
         auth.set_endpoint(&endpoint).await;
@@ -173,10 +181,9 @@ impl Network {
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
-        let router = crate::Router::builder(topic_discovery_hook)
+        let router = crate::Router::builder()
             .entry_name(name)
             .password(password)
-            .secret_key(secret_key)
             .endpoint(endpoint.clone())
             .gossip(gossip)
             .build()
@@ -185,26 +192,29 @@ impl Network {
         direct.set_router(router.clone()).await?;
 
         let (to_remote_writer, to_remote_reader) = tokio::sync::mpsc::channel(1024 * 16);
-        let (api, _) = Handle::spawn_with(NetworkActor {
-            router,
-            direct,
-            _auth: auth,
+        let (api, _) = Handle::spawn_with(
+            NetworkActor {
+                router,
+                direct,
+                _auth: auth,
 
-            _iroh_router,
-            //_docs_router,
-            iroh_endpoint: endpoint,
+                _iroh_router,
+                //_docs_router,
+                iroh_endpoint: endpoint,
 
-            tun: None,
-            tun_ip_debug: None,
-            _local_to_direct_tx: to_remote_writer,
-            local_to_direct_rx: to_remote_reader,
-            _direct_to_local_tx: direct_connect_tx,
-            direct_to_local_rx: direct_connect_rx,
+                tun: None,
+                tun_ip_debug: None,
+                _local_to_direct_tx: to_remote_writer,
+                local_to_direct_rx: to_remote_reader,
+                _direct_to_local_tx: direct_connect_tx,
+                direct_to_local_rx: direct_connect_rx,
 
-            ip_cache: HashMap::new(),
-            peer_ids: HashSet::new(),
-            pending_packets: HashMap::new(),
-        }, |mut actor, rx| async move { actor.run(rx).await });
+                ip_cache: HashMap::new(),
+                peer_ids: HashSet::new(),
+                pending_packets: HashMap::new(),
+            },
+            |mut actor, rx| async move { actor.run(rx).await },
+        );
 
         Ok(Self { api })
     }
@@ -337,7 +347,7 @@ impl NetworkActor {
                         for ip in cached_ips {
                             if let std::collections::hash_map::Entry::Vacant(e) = router_peers.entry(ip)
                                 && let Some(owner_id) = self.ip_cache.get(&ip)
-                                    && matches!(self.direct.get_peer_state(*owner_id).await, Ok(ConnState::Open) | Ok(ConnState::Connecting)) {
+                                    && matches!(self.direct.get_peer_state(*owner_id).await, Ok(InnerConnState::Open) | Ok(InnerConnState::Connecting)) {
                                         debug!("[Data-Plane Liveness] Preserving route to {} (owned by {}) despite Router/Doc miss. Connection is OPEN.", ip, owner_id);
                                         e.insert(*owner_id);
                                         next_peer_ids.insert(*owner_id);
@@ -358,7 +368,7 @@ impl NetworkActor {
                                 }
                                 if let Some(id) = self.ip_cache.get(&ip).copied() {
                                     let peer_state = self.direct.get_peer_state(id).await;
-                                    if !matches!(peer_state, Ok(ConnState::Open)) {
+                                    if !matches!(peer_state, Ok(InnerConnState::Open)) {
                                         continue;
                                     }
 

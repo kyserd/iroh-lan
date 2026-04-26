@@ -4,11 +4,18 @@ use iroh::{Endpoint, EndpointId, endpoint::Connection, protocol::ProtocolHandler
 use n0_watcher::Watchable;
 use noq::VarInt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, hash_map::Entry};
-use tokio::time::Instant;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
-use crate::{ConnState, Router, RouterIp, connection::Conn, local_networking::Ipv4Pkg};
+use crate::{
+    Router, RouterIp,
+    connection::{Conn, InnerConnState},
+    local_networking::Ipv4Pkg,
+};
 
 const MAX_RECONNECT_ATTEMPTS: usize = 50;
 
@@ -26,20 +33,16 @@ pub enum PeerState {
 
 #[derive(Debug, Clone)]
 pub struct ConnGen {
-    conn: Watchable<Option<Conn>>,
-    promoted: Watchable<Option<Instant>>,
-    accept_conn: Watchable<PeerState>,
-    open_conn: Watchable<PeerState>,
+    accept_conn: Arc<Mutex<PeerState>>,
+    open_conn: Arc<Mutex<PeerState>>,
     attempts: Watchable<usize>,
 }
 
 impl Default for ConnGen {
     fn default() -> Self {
         Self {
-            conn: Watchable::new(None),
-            promoted: Watchable::new(None),
-            accept_conn: Watchable::new(PeerState::NoConnection),
-            open_conn: Watchable::new(PeerState::NoConnection),
+            accept_conn: Arc::new(Mutex::new(PeerState::NoConnection)),
+            open_conn: Arc::new(Mutex::new(PeerState::NoConnection)),
             attempts: Watchable::new(0),
         }
     }
@@ -53,7 +56,7 @@ struct DirectActor {
     router: Option<Router>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum DirectMessage {
     IpPacket(Ipv4Pkg),
     IDontLikeWarnings,
@@ -65,14 +68,15 @@ impl Direct {
         endpoint: iroh::endpoint::Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     ) -> Self {
-        let (api, _) = Handle::spawn_with(DirectActor {
-            peers: HashMap::new(),
-            endpoint,
-            direct_connect_tx,
-            router: None,
-        }, |mut actor, rx| async move {
-            actor.run(rx).await
-        });
+        let (api, _) = Handle::spawn_with(
+            DirectActor {
+                peers: HashMap::new(),
+                endpoint,
+                direct_connect_tx,
+                router: None,
+            },
+            |mut actor, rx| async move { actor.run(rx).await },
+        );
         Self { api }
     }
 
@@ -89,9 +93,7 @@ impl Direct {
     }
 
     pub async fn ensure_connection(&self, to: EndpointId) -> Result<()> {
-        self.api
-            .call(act!(actor => actor.ensure_connection(to)))
-            .await
+        self.api.call(act!(actor => actor.ensure_peer(to))).await
     }
 
     pub async fn set_router(&self, router: Router) -> Result<()> {
@@ -107,7 +109,7 @@ impl Direct {
             .unwrap()
     }
 
-    pub async fn get_peer_state(&self, endpoint_id: EndpointId) -> Result<ConnState> {
+    pub async fn get_peer_state(&self, endpoint_id: EndpointId) -> Result<InnerConnState> {
         self.api
             .call(act!(actor => actor.get_peer_state(endpoint_id)))
             .await
@@ -165,61 +167,44 @@ impl DirectActor {
 
     async fn connection_driver(&mut self) {
         for (id, peer) in self.peers.clone() {
-            if peer.attempts.get() > MAX_RECONNECT_ATTEMPTS {
-                if let Some(stale_conn) = peer.conn.get()
-                    && peer.attempts.get() > MAX_RECONNECT_ATTEMPTS
+            // check reserve connections for alive
+            {
+                let mut open_guard = peer.open_conn.lock().await;
+                if let PeerState::Connected(conn) = &*open_guard
+                    && !conn.is_alive().await
+                {
+                    debug!("Open connection to {} is no longer alive, dropping", id);
+                    conn.drop().await;
+                    *open_guard = PeerState::NoConnection;
+                }
+
+                if *open_guard == PeerState::NoConnection
+                    && peer.attempts.get() <= MAX_RECONNECT_ATTEMPTS
                 {
                     debug!(
-                        "Dropping stale connection to {} after {} failed attempts",
+                        "Peer {} has no open connection and {} attempts, will try to reconnect",
                         id,
                         peer.attempts.get()
                     );
-                    stale_conn.drop().await;
-                    peer.conn.set(None).ok();
+                    drop(open_guard);
+                    Self::open_new_connection(
+                        id,
+                        peer.clone(),
+                        self.endpoint.clone(),
+                        self.direct_connect_tx.clone(),
+                    )
+                    .await;
                 }
-
-                continue;
             }
 
-            match (peer.open_conn.get(), peer.accept_conn.get()) {
-                (PeerState::Connected(_), PeerState::Connected(_))
-                | (PeerState::Connected(_), PeerState::NoConnection | PeerState::Connecting)
-                | (PeerState::NoConnection | PeerState::Connecting, PeerState::Connected(_)) => {
-                    self.promote_new_conn(peer, id).await;
-                }
-                (PeerState::NoConnection, PeerState::NoConnection) => {
-                    let open_new = if let Some(conn) = peer.conn.get()
-                        && matches!(
-                            conn.get_state().await.get(),
-                            crate::connection::ConnState::Disconnected
-                                | crate::connection::ConnState::Closed
-                                | crate::connection::ConnState::ClosedAndStopped
-                        ) {
-                        true
-                    } else {
-                        peer.conn.get().is_none()
-                    };
-
-                    if open_new {
-                        let attempts = peer.attempts.clone();
-                        attempts.set(attempts.get() + 1).ok();
-                        Self::open_new_connection(
-                            id,
-                            peer.clone(),
-                            self.endpoint.clone(),
-                            self.direct_connect_tx.clone(),
-                        )
-                        .await;
-                    }
-                }
-                _ => {
-                    /*debug!(
-                        "Peer {} is in intermediate state (open={:?}, accept={:?}), skipping",
-                        id,
-                        peer.open_conn.get(),
-                        peer.accept_conn.get()
-                    );*/
-                    continue;
+            {
+                let mut accept_guard = peer.accept_conn.lock().await;
+                if let PeerState::Connected(conn) = &*accept_guard
+                    && !conn.is_alive().await
+                {
+                    debug!("Accept connection to {} is no longer alive, dropping", id);
+                    conn.drop().await;
+                    *accept_guard = PeerState::NoConnection;
                 }
             }
         }
@@ -231,7 +216,9 @@ impl DirectActor {
         endpoint: Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     ) {
-        peer.open_conn.set(PeerState::Connecting).ok();
+        let mut guard = peer.open_conn.lock().await;
+        *guard = PeerState::Connecting;
+        drop(guard);
 
         // Try open new connection
         tokio::spawn(async move {
@@ -239,7 +226,8 @@ impl DirectActor {
             match Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx).await {
                 Ok(new_conn) => {
                     debug!("Successfully established connection to {}", peer_id);
-                    if peer.open_conn.get() != PeerState::Connecting {
+                    let mut guard = peer.open_conn.lock().await;
+                    if *guard != PeerState::Connecting {
                         debug!(
                             "Connection to {} is no longer in Connecting state, dropping new connection",
                             peer_id
@@ -247,100 +235,25 @@ impl DirectActor {
                         new_conn.drop().await;
                         return;
                     }
-                    peer.open_conn
-                        .set(PeerState::Connected(new_conn.clone()))
-                        .ok();
+                    if new_conn.is_alive().await {
+                        *guard = PeerState::Connected(new_conn.clone());
+                        info!("New connection to {} is now open", peer_id);
+                    } else {
+                        debug!(
+                            "New connection to {} is not alive after establishment, dropping",
+                            peer_id
+                        );
+                        new_conn.drop().await;
+                        *guard = PeerState::NoConnection;
+                    }
                 }
                 Err(err) => {
-                    error!(
-                        "Failed to establish connection to {}: {}: {:?}",
-                        peer_id, err, err
-                    );
-                    peer.open_conn.set(PeerState::NoConnection).ok();
+                    error!("Failed to establish connection to {}: {}", peer_id, err);
+                    let mut guard = peer.open_conn.lock().await;
+                    *guard = PeerState::NoConnection;
                 }
             }
         });
-    }
-
-    async fn promote_new_conn(&mut self, peer: ConnGen, peer_id: EndpointId) {
-        debug!("Promoting new connection to {}", peer_id);
-
-        match (peer.open_conn.get(), peer.accept_conn.get()) {
-            (PeerState::Connected(open), PeerState::Connected(accept)) => {
-                if let Some(old_conn) = peer.conn.get() {
-                    debug!("Dropping old connection to {} during promotion", peer_id);
-                    old_conn.drop().await;
-                }
-                if peer_id < self.endpoint.id() {
-                    debug!("Promoting accept connection for {}", peer_id);
-                    peer.conn.set(Some(accept)).ok();
-                    open.drop().await;
-                    peer.open_conn.set(PeerState::NoConnection).ok();
-                } else {
-                    debug!("Promoting open connection for {}", peer_id);
-                    peer.conn.set(Some(open)).ok();
-                    accept.drop().await;
-                    peer.accept_conn.set(PeerState::NoConnection).ok();
-                }
-                peer.open_conn.set(PeerState::NoConnection).ok();
-                peer.accept_conn.set(PeerState::NoConnection).ok();
-                peer.attempts.set(0).ok();
-                peer.promoted.set(Some(Instant::now())).ok();
-            }
-            (PeerState::Connected(open), PeerState::NoConnection | PeerState::Connecting) => {
-                /*if let Some(promoted) = peer.promoted.get()
-                    && promoted.elapsed() < Duration::from_secs(3)
-                {
-                    println!("RACE Accept");
-                }
-                if let Some(promoted) = peer.promoted.get()
-                    && promoted.elapsed() < Duration::from_secs(3)
-                    && peer_id < self.endpoint.id()
-                {
-                    info!("Probably a race, not promoting, lost peer_id comparison (open)");
-                    peer.open_conn.set(PeerState::NoConnection).ok();
-                    open.drop().await;
-                    return;
-                }*/
-                debug!("Promoting open connection for {}", peer_id);
-                if let Some(old_conn) = peer.conn.get() {
-                    debug!("Dropping old connection to {} during promotion", peer_id);
-                    old_conn.drop().await;
-                }
-                peer.conn.set(Some(open)).ok();
-                peer.open_conn.set(PeerState::NoConnection).ok();
-                peer.attempts.set(0).ok();
-                peer.promoted.set(Some(Instant::now())).ok();
-            }
-            (PeerState::NoConnection | PeerState::Connecting, PeerState::Connected(accept)) => {
-                /*if let Some(promoted) = peer.promoted.get()
-                    && promoted.elapsed() < Duration::from_secs(3)
-                {
-                    println!("RACE Accept");
-                }
-                if let Some(promoted) = peer.promoted.get()
-                    && promoted.elapsed() < Duration::from_secs(3)
-                    && peer_id >= self.endpoint.id()
-                {
-                    info!("Probably a race, not promoting, lost peer_id comparison (accept)");
-                    peer.accept_conn.set(PeerState::NoConnection).ok();
-                    accept.drop().await;
-                    return;
-                }*/
-                debug!("Promoting accept connection for {}", peer_id);
-                if let Some(old_conn) = peer.conn.get() {
-                    debug!("Dropping old connection to {} during promotion", peer_id);
-                    old_conn.drop().await;
-                }
-                peer.conn.set(Some(accept)).ok();
-                peer.accept_conn.set(PeerState::NoConnection).ok();
-                peer.attempts.set(0).ok();
-                peer.promoted.set(Some(Instant::now())).ok();
-            }
-            _ => {
-                unreachable!("Invalid state during promotion for {}", peer_id);
-            }
-        }
     }
 
     async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) -> Result<()> {
@@ -348,74 +261,84 @@ impl DirectActor {
         let router = self.router.clone();
         let peer = self.peers.entry(conn.remote_id()).or_default().clone();
         let direct_connect_tx = self.direct_connect_tx.clone();
-        if peer.accept_conn.get() != PeerState::NoConnection {
-            error!(
-                "Already have an active or pending connection with {}, rejecting new connection",
-                conn.remote_id()
-            );
-            return Err(anyhow::anyhow!(
-                "Already have an active or pending connection with {}",
-                conn.remote_id()
-            ));
+
+        {
+            let mut guard = peer.accept_conn.lock().await;
+            if let PeerState::Connected(existing_conn) = &*guard {
+                existing_conn.drop().await;
+            }
+
+            *guard = PeerState::Connecting;
         }
-        peer.accept_conn.set(PeerState::Connecting).ok();
 
-        tokio::spawn(async move {
-            info!("New direct connection from {:?}", conn.remote_id());
-            let remote_id = conn.remote_id();
-            if let Some(router) = &router {
-                if !matches!(router.get_ip_state().await, Ok(RouterIp::AssignedIp(_))) {
-                    info!(
-                        "Accepting connection from {} before local IP assignment",
-                        remote_id
-                    );
-                }
+        info!("New direct connection from {:?}", conn.remote_id());
+        let remote_id = conn.remote_id();
 
-                if router.get_ip_from_endpoint_id(remote_id).await.is_err() {
-                    info!(
-                        "Accepting connection from {} before remote IP assignment",
-                        remote_id
-                    );
-                }
-            } else {
+        // logging
+        if let Some(router) = &router {
+            if !matches!(router.get_ip_state().await, Ok(RouterIp::AssignedIp(_))) {
                 info!(
-                    "Accepting connection from {} before router ready",
+                    "Accepting connection from {} before local IP assignment",
                     remote_id
                 );
             }
 
-            let remote_id = conn.remote_id();
-
-            match Conn::accept_connection(conn.clone(), direct_connect_tx.clone()).await {
-                Ok(remote_conn) => {
-                    debug!("Successfully accepted connection from {}", remote_id);
-                    if peer.accept_conn.get() != PeerState::Connecting {
-                        debug!(
-                            "Connection to {} is no longer in Connecting state, dropping accepted connection",
-                            remote_id
-                        );
-                        remote_conn.drop().await;
-                        return Ok(());
-                    }
-                    peer.accept_conn
-                        .set(PeerState::Connected(remote_conn.clone()))
-                        .ok();
-                    Ok(())
-                }
-                Err(err) => {
-                    error!("Failed to accept connection from {}: {}", remote_id, err);
-
-                    peer.accept_conn.set(PeerState::NoConnection).ok();
-                    conn.close(VarInt::from_u32(411), b"Failed to accept connection");
-                    Err(anyhow::anyhow!(
-                        "Failed to accept connection from {}: {}",
-                        remote_id,
-                        err
-                    ))
-                }
+            if router.get_ip_from_endpoint_id(remote_id).await.is_err() {
+                info!(
+                    "Accepting connection from {} before remote IP assignment",
+                    remote_id
+                );
             }
-        });
-        Ok(())
+        } else {
+            info!(
+                "Accepting connection from {} before router ready",
+                remote_id
+            );
+        }
+
+        let remote_id = conn.remote_id();
+
+        match Conn::accept_connection(conn.clone(), direct_connect_tx.clone()).await {
+            Ok(remote_conn) => {
+                debug!("Successfully accepted connection from {}", remote_id);
+                let mut guard = peer.accept_conn.lock().await;
+                if *guard != PeerState::Connecting {
+                    debug!(
+                        "Connection to {} is no longer in Connecting state, dropping accepted connection",
+                        remote_id
+                    );
+                    remote_conn.drop().await;
+                    return Ok(());
+                }
+                if remote_conn.is_alive().await {
+                    *guard = PeerState::Connected(remote_conn.clone());
+                } else {
+                    *guard = PeerState::NoConnection;
+                    debug!(
+                        "Accepted connection from {} is not alive after establishment, dropping",
+                        remote_id
+                    );
+                    remote_conn.drop().await;
+                    return Err(anyhow::anyhow!(
+                        "Accepted connection from {} is not alive after establishment",
+                        remote_id
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) => {
+                error!("Failed to accept connection from {}: {}", remote_id, err);
+
+                let mut guard = peer.accept_conn.lock().await;
+                *guard = PeerState::NoConnection;
+                conn.close(VarInt::from_u32(411), b"Failed to accept connection");
+                Err(anyhow::anyhow!(
+                    "Failed to accept connection from {}: {}",
+                    remote_id,
+                    err
+                ))
+            }
+        }
     }
 
     async fn route_packet(&mut self, to: EndpointId, pkg: DirectMessage) -> Result<()> {
@@ -423,65 +346,112 @@ impl DirectActor {
         match self.peers.entry(to) {
             Entry::Occupied(entry) => {
                 let peer = entry.get();
-                let local_conn = if let Some(conn) = peer.conn.get() {
-                    conn
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Connection to {} is not currently open",
-                        to
-                    ));
+
+                // decide which conn to use based on connection availability
+
+                // we send over the one with the closest last_keep_alive to ensure we don't send over a connection that might be dead but hasn't been cleaned up yet.
+                let last_keep_alive_open =
+                    if let PeerState::Connected(conn) = &*peer.open_conn.lock().await {
+                        Some(conn.last_keep_alive().await)
+                    } else {
+                        None
+                    };
+                let last_keep_alive_accept =
+                    if let PeerState::Connected(conn) = &*peer.accept_conn.lock().await {
+                        Some(conn.last_keep_alive().await)
+                    } else {
+                        None
+                    };
+
+                let conns_to_attempt = match (last_keep_alive_open, last_keep_alive_accept) {
+                    (Some(open_time), Some(accept_time)) => {
+                        if open_time > accept_time {
+                            vec![&peer.open_conn, &peer.accept_conn]
+                        } else {
+                            vec![&peer.accept_conn, &peer.open_conn]
+                        }
+                    }
+                    (Some(_), None) => {
+                        vec![&peer.open_conn]
+                    }
+                    (None, Some(_)) => {
+                        debug!(
+                            "Routing packet to {} over accept connection (open connection not available)",
+                            to
+                        );
+                        vec![&peer.accept_conn]
+                    }
+                    (None, None) => {
+                        debug!("No available connections to {}, cannot route packet", to);
+                        return Err(anyhow::anyhow!(
+                            "Failed to write packet to peer {}: no open connections",
+                            to
+                        ));
+                    }
                 };
-                if local_conn.get_state().await.get() != ConnState::Open {
-                    return Err(anyhow::anyhow!(
-                        "Connection to {} is not currently open",
-                        to
-                    ));
+
+                for conn in conns_to_attempt {
+                    let guard = conn.lock().await;
+                    if let PeerState::Connected(conn) = &*guard
+                        && conn.is_alive().await
+                        && conn.write(pkg.clone()).await.is_ok()
+                    {
+                        return Ok(());
+                    }
                 }
-                if let Err(e) = local_conn.write(pkg).await {
-                    error!("Failed to write packet to peer {}: {}", to, e);
-                    return Err(e);
-                }
+                error!("Failed to write packet to peer {}: no open connections", to);
+                Err(anyhow::anyhow!(
+                    "Failed to write packet to peer {}: no open connections",
+                    to
+                ))
             }
             Entry::Vacant(entry) => {
                 info!("No active connection to {}, initiating new connection", to);
                 entry.insert(Default::default());
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "No active connection to {}, initiating new connection",
                     to
-                ));
+                ))
             }
         }
-
-        Ok(())
     }
 
-    async fn ensure_connection(&mut self, to: EndpointId) -> Result<()> {
+    async fn ensure_peer(&mut self, to: EndpointId) -> Result<()> {
         if self.peers.contains_key(&to) {
             return Ok(());
         }
 
         info!(
-            "No active connection to {}, initiating new connection (ensure_connection)",
+            "No active connection to {}, initiating new connection (ensure_peer)",
             to
         );
         self.peers.insert(to, Default::default());
         Ok(())
     }
 
-    pub async fn get_peer_state(&self, endpoint_id: EndpointId) -> Result<ConnState> {
+    pub async fn get_peer_state(&self, endpoint_id: EndpointId) -> Result<InnerConnState> {
         let peer = self
             .peers
             .get(&endpoint_id)
             .ok_or(anyhow::anyhow!("no connection to peer"))?;
-        if let Some(conn) = peer.conn.get() {
-            return Ok(conn.get_state().await.get());
+
+        let conns = vec![&peer.accept_conn, &peer.open_conn];
+
+        for conn in conns.clone() {
+            let guard = conn.lock().await;
+            if let PeerState::Connected(conn) = &*guard
+                && conn.is_alive().await
+            {
+                return Ok(InnerConnState::Open);
+            }
         }
-        if peer.open_conn.get() != PeerState::NoConnection
-            || peer.accept_conn.get() != PeerState::NoConnection
-        {
-            return Ok(ConnState::Connecting);
+        for conn in conns {
+            let guard = conn.lock().await;
+            if let PeerState::Connecting = &*guard {
+                return Ok(InnerConnState::Connecting);
+            }
         }
-        Ok(ConnState::Closed)
+        Ok(InnerConnState::Closed)
     }
 
     pub async fn get_endpoint(&self) -> Result<iroh::endpoint::Endpoint> {
@@ -494,8 +464,11 @@ impl DirectActor {
 
     pub async fn close(&mut self) -> Result<()> {
         for (_, conn) in self.peers.drain() {
-            if let Some(conn) = conn.conn.get() {
-                conn.drop().await;
+            for conn in [&conn.accept_conn, &conn.open_conn] {
+                let guard = conn.lock().await;
+                if let PeerState::Connected(conn) = &*guard {
+                    conn.drop().await;
+                }
             }
         }
         Ok(())
