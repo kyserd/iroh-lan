@@ -15,7 +15,7 @@ edition = "2024"
 anyhow = "1"
 iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="6c491a161c40d07a0e4613d0f68924c1fef7d2c4" }
 ed25519-dalek = "3.0.0-pre.6"
-iroh = { version="0.98.1", features=["address-lookup-pkarr-dht", "qlog", "tls-ring"] }
+iroh = { version="0.98.2", features=["address-lookup-pkarr-dht", "qlog", "tls-ring"] }
 iroh-gossip = "0.98.0"
 runas = "1"
 tokio = "1"
@@ -26,6 +26,7 @@ pnet_packet = "0.35"
 tun-rs = { version = "2.8", features = ["async"] }
 serde = "1"
 futures = "0.3"
+futures-lite = "2"
 postcard = { version = "1", features = ["use-std"] }
 sha2 = "0.10"
 z32 = "1"
@@ -33,9 +34,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 chrono = { version = "0.4" }
-n0-watcher = "0.6"
+n0-watcher = "0.6.1"
+if-addrs = "0.15"
+ipnet = "2"
 
-iroh-auth = { git="https://github.com/rustonbsd/iroh-auth", rev="572b662c675c821945538e66e020801408960b48" }
+iroh-auth = { path="../iroh-auth" }#{ git="https://github.com/rustonbsd/iroh-auth", rev="572b662c675c821945538e66e020801408960b48" }
 actor-helper = { version="0.3.0", features=["anyhow", "tokio"]} #{ git = "https://github.com/rustonbsd/actor-helper", rev="9af542cc2d26354dcc4d87d270408326aa319397", features=["anyhow", "tokio"] }
 clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30.0"

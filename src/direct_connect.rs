@@ -6,9 +6,9 @@ use noq::VarInt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, hash_map::Entry},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
 };
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use tracing::{debug, error, info, trace};
 
 use crate::{
@@ -18,31 +18,25 @@ use crate::{
 };
 
 const MAX_RECONNECT_ATTEMPTS: usize = 50;
+const CONN_COUNT_TARGET: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct Direct {
     api: Handle<DirectActor, anyhow::Error>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerState {
-    NoConnection,
-    Connecting,
-    Connected(Conn),
-}
-
 #[derive(Debug, Clone)]
 pub struct ConnGen {
-    accept_conn: Arc<Mutex<PeerState>>,
-    open_conn: Arc<Mutex<PeerState>>,
+    conn_pool: Arc<Mutex<Vec<Conn>>>,
+    conn_counter: Arc<AtomicUsize>,
     attempts: Watchable<usize>,
 }
 
 impl Default for ConnGen {
     fn default() -> Self {
         Self {
-            accept_conn: Arc::new(Mutex::new(PeerState::NoConnection)),
-            open_conn: Arc::new(Mutex::new(PeerState::NoConnection)),
+            conn_pool: Arc::new(Mutex::new(Vec::new())),
+            conn_counter: Arc::new(AtomicUsize::new(0)),
             attempts: Watchable::new(0),
         }
     }
@@ -169,43 +163,36 @@ impl DirectActor {
         for (id, peer) in self.peers.clone() {
             // check reserve connections for alive
             {
-                let mut open_guard = peer.open_conn.lock().await;
-                if let PeerState::Connected(conn) = &*open_guard
-                    && !conn.is_alive().await
-                {
-                    debug!("Open connection to {} is no longer alive, dropping", id);
-                    conn.drop().await;
-                    *open_guard = PeerState::NoConnection;
+                let mut tbd = Vec::new();
+                let mut guard = peer.conn_pool.lock().await;
+                for conn in guard.iter_mut() {
+                    if !conn.is_alive().await
+                    {
+                        debug!("Open connection to {} is no longer alive, dropping", id);
+                        conn.drop().await;
+                        tbd.push(conn.id());
+                        peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
+                guard.retain(|conn| !tbd.contains(&conn.id()));
 
-                if *open_guard == PeerState::NoConnection
-                    && peer.attempts.get() <= MAX_RECONNECT_ATTEMPTS
-                {
-                    debug!(
-                        "Peer {} has no open connection and {} attempts, will try to reconnect",
-                        id,
-                        peer.attempts.get()
-                    );
-                    drop(open_guard);
-                    Self::open_new_connection(
-                        id,
-                        peer.clone(),
-                        self.endpoint.clone(),
-                        self.direct_connect_tx.clone(),
-                    )
-                    .await;
-                }
-            }
-
-            {
-                let mut accept_guard = peer.accept_conn.lock().await;
-                if let PeerState::Connected(conn) = &*accept_guard
-                    && !conn.is_alive().await
-                {
-                    debug!("Accept connection to {} is no longer alive, dropping", id);
-                    conn.drop().await;
-                    *accept_guard = PeerState::NoConnection;
-                }
+                if peer.conn_counter.load(std::sync::atomic::Ordering::SeqCst) < CONN_COUNT_TARGET
+                        && peer.attempts.get() <= MAX_RECONNECT_ATTEMPTS
+                    {
+                        debug!(
+                            "Peer {} has no open connection and {} attempts, will try to reconnect",
+                            id,
+                            peer.attempts.get()
+                        );
+                        drop(guard);
+                        Self::open_new_connection(
+                            id,
+                            peer.clone(),
+                            self.endpoint.clone(),
+                            self.direct_connect_tx.clone(),
+                        )
+                        .await;
+                    }
             }
         }
     }
@@ -216,9 +203,7 @@ impl DirectActor {
         endpoint: Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     ) {
-        let mut guard = peer.open_conn.lock().await;
-        *guard = PeerState::Connecting;
-        drop(guard);
+        peer.conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Try open new connection
         tokio::spawn(async move {
@@ -226,50 +211,35 @@ impl DirectActor {
             match Conn::open_connection(endpoint.clone(), peer_id, direct_connect_tx).await {
                 Ok(new_conn) => {
                     debug!("Successfully established connection to {}", peer_id);
-                    let mut guard = peer.open_conn.lock().await;
-                    if *guard != PeerState::Connecting {
-                        debug!(
-                            "Connection to {} is no longer in Connecting state, dropping new connection",
-                            peer_id
-                        );
-                        new_conn.drop().await;
-                        return;
-                    }
                     if new_conn.is_alive().await {
-                        *guard = PeerState::Connected(new_conn.clone());
+                        let mut guard = peer.conn_pool.lock().await;
+                        guard.push(new_conn.clone());
                         info!("New connection to {} is now open", peer_id);
                     } else {
                         debug!(
                             "New connection to {} is not alive after establishment, dropping",
                             peer_id
                         );
+                        peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         new_conn.drop().await;
-                        *guard = PeerState::NoConnection;
                     }
                 }
                 Err(err) => {
+                    peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     error!("Failed to establish connection to {}: {}", peer_id, err);
-                    let mut guard = peer.open_conn.lock().await;
-                    *guard = PeerState::NoConnection;
                 }
             }
         });
     }
 
     async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) -> Result<()> {
+        
         info!("Handling new connection from {}", conn.remote_id());
         let router = self.router.clone();
         let peer = self.peers.entry(conn.remote_id()).or_default().clone();
         let direct_connect_tx = self.direct_connect_tx.clone();
 
-        {
-            let mut guard = peer.accept_conn.lock().await;
-            if let PeerState::Connected(existing_conn) = &*guard {
-                existing_conn.drop().await;
-            }
-
-            *guard = PeerState::Connecting;
-        }
+        peer.conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         info!("New direct connection from {:?}", conn.remote_id());
         let remote_id = conn.remote_id();
@@ -301,24 +271,16 @@ impl DirectActor {
         match Conn::accept_connection(conn.clone(), direct_connect_tx.clone()).await {
             Ok(remote_conn) => {
                 debug!("Successfully accepted connection from {}", remote_id);
-                let mut guard = peer.accept_conn.lock().await;
-                if *guard != PeerState::Connecting {
-                    debug!(
-                        "Connection to {} is no longer in Connecting state, dropping accepted connection",
-                        remote_id
-                    );
-                    remote_conn.drop().await;
-                    return Ok(());
-                }
                 if remote_conn.is_alive().await {
-                    *guard = PeerState::Connected(remote_conn.clone());
+                    let mut guard = peer.conn_pool.lock().await;
+                    guard.push(remote_conn.clone());
                 } else {
-                    *guard = PeerState::NoConnection;
                     debug!(
                         "Accepted connection from {} is not alive after establishment, dropping",
                         remote_id
                     );
                     remote_conn.drop().await;
+                    peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     return Err(anyhow::anyhow!(
                         "Accepted connection from {} is not alive after establishment",
                         remote_id
@@ -328,10 +290,8 @@ impl DirectActor {
             }
             Err(err) => {
                 error!("Failed to accept connection from {}: {}", remote_id, err);
-
-                let mut guard = peer.accept_conn.lock().await;
-                *guard = PeerState::NoConnection;
                 conn.close(VarInt::from_u32(411), b"Failed to accept connection");
+                peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 Err(anyhow::anyhow!(
                     "Failed to accept connection from {}: {}",
                     remote_id,
@@ -347,54 +307,19 @@ impl DirectActor {
             Entry::Occupied(entry) => {
                 let peer = entry.get();
 
-                // decide which conn to use based on connection availability
+                let mut attempt_order = Vec::new();
+                let guard = peer.conn_pool.lock().await;
+                for conn in guard.iter() {
+                    if conn.is_alive().await {
+                        let keep_alive = conn.last_keep_alive().await;
+                        attempt_order.push((keep_alive, conn));
+                    }
+                }
+                attempt_order.sort_by_key(|(v,_)| Instant::now().duration_since(*v));
 
-                // we send over the one with the closest last_keep_alive to ensure we don't send over a connection that might be dead but hasn't been cleaned up yet.
-                let last_keep_alive_open =
-                    if let PeerState::Connected(conn) = &*peer.open_conn.lock().await {
-                        Some(conn.last_keep_alive().await)
-                    } else {
-                        None
-                    };
-                let last_keep_alive_accept =
-                    if let PeerState::Connected(conn) = &*peer.accept_conn.lock().await {
-                        Some(conn.last_keep_alive().await)
-                    } else {
-                        None
-                    };
 
-                let conns_to_attempt = match (last_keep_alive_open, last_keep_alive_accept) {
-                    (Some(open_time), Some(accept_time)) => {
-                        if open_time > accept_time {
-                            vec![&peer.open_conn, &peer.accept_conn]
-                        } else {
-                            vec![&peer.accept_conn, &peer.open_conn]
-                        }
-                    }
-                    (Some(_), None) => {
-                        vec![&peer.open_conn]
-                    }
-                    (None, Some(_)) => {
-                        debug!(
-                            "Routing packet to {} over accept connection (open connection not available)",
-                            to
-                        );
-                        vec![&peer.accept_conn]
-                    }
-                    (None, None) => {
-                        debug!("No available connections to {}, cannot route packet", to);
-                        return Err(anyhow::anyhow!(
-                            "Failed to write packet to peer {}: no open connections",
-                            to
-                        ));
-                    }
-                };
-
-                for conn in conns_to_attempt {
-                    let guard = conn.lock().await;
-                    if let PeerState::Connected(conn) = &*guard
-                        && conn.is_alive().await
-                        && conn.write(pkg.clone()).await.is_ok()
+                for (_, conn) in attempt_order {
+                    if conn.write(pkg.clone()).await.is_ok()
                     {
                         return Ok(());
                     }
@@ -435,20 +360,11 @@ impl DirectActor {
             .get(&endpoint_id)
             .ok_or(anyhow::anyhow!("no connection to peer"))?;
 
-        let conns = vec![&peer.accept_conn, &peer.open_conn];
-
-        for conn in conns.clone() {
-            let guard = conn.lock().await;
-            if let PeerState::Connected(conn) = &*guard
-                && conn.is_alive().await
+        let guard = peer.conn_pool.lock().await;
+        for conn in guard.iter() {
+            if conn.is_alive().await
             {
                 return Ok(InnerConnState::Open);
-            }
-        }
-        for conn in conns {
-            let guard = conn.lock().await;
-            if let PeerState::Connecting = &*guard {
-                return Ok(InnerConnState::Connecting);
             }
         }
         Ok(InnerConnState::Closed)
@@ -463,12 +379,11 @@ impl DirectActor {
     }
 
     pub async fn close(&mut self) -> Result<()> {
-        for (_, conn) in self.peers.drain() {
-            for conn in [&conn.accept_conn, &conn.open_conn] {
-                let guard = conn.lock().await;
-                if let PeerState::Connected(conn) = &*guard {
-                    conn.drop().await;
-                }
+        for (_, conn_gen) in self.peers.drain() {
+            let guard = conn_gen.conn_pool.lock().await;
+            conn_gen.conn_counter.store(0, std::sync::atomic::Ordering::SeqCst);
+            for conn in guard.iter() {
+                conn.drop().await;
             }
         }
         Ok(())

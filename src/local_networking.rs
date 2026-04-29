@@ -1,11 +1,11 @@
 use anyhow::Result;
 use pnet_packet::{
     MutablePacket, Packet,
-    icmp::{MutableIcmpPacket, checksum as icmp_checksum},
+    icmp::{IcmpPacket, MutableIcmpPacket, checksum as icmp_checksum},
     ip::IpNextHeaderProtocols,
     ipv4::{Ipv4Flags, Ipv4Packet, MutableIpv4Packet, checksum},
-    tcp::{MutableTcpPacket, ipv4_checksum as tcp_ipv4_checksum},
-    udp::{MutableUdpPacket, ipv4_checksum as udp_ipv4_checksum},
+    tcp::{MutableTcpPacket, TcpPacket, ipv4_checksum as tcp_ipv4_checksum},
+    udp::{MutableUdpPacket, UdpPacket, ipv4_checksum as udp_ipv4_checksum},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +13,7 @@ use std::{
     net::Ipv4Addr,
     time::{Duration, Instant},
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 
 use actor_helper::{Action, Handle, Receiver, act};
@@ -86,12 +86,15 @@ impl Tun {
             .build_async()?;
 
         let (tun_tx, tun_rx) = tokio::sync::mpsc::channel(1024 * 16);
-        let (api, _) = Handle::spawn_with(TunActor {
+        let (api, _) = Handle::spawn_with(
+            TunActor {
                 ip,
                 to_remote_writer: to_remote_writer.clone(),
                 dev,
                 tun_rx,
-            }, |mut actor, rx| async move {actor.run(rx).await} );
+            },
+            |mut actor, rx| async move { actor.run(rx).await },
+        );
         Ok(Self { api, tun_tx })
     }
 
@@ -125,110 +128,140 @@ impl TunActor {
         info!("TunActor started for IP: {}", self.ip);
         loop {
             tokio::select! {
-                Ok(action) = rx.recv_async() => {
-                    action(self).await;
-                }
+                            Ok(action) = rx.recv_async() => {
+                                action(self).await;
+                            }
 
-                // Write path: Network -> TUN
-                Some(pkg) = self.tun_rx.recv() => {
-                    if let Ok(packet) = pkg.to_ipv4_packet() {
-                        let data = packet.packet();
-                        match self.dev.send(data).await {
-                            Ok(_) => {}
-                            Err(e) => warn!("Failed to write to TUN: {}", e),
-                        }
-                    }
-                }
-
-                // Read path: TUN -> Network
-                Ok(len) = self.dev.recv(&mut dev_buf) => {
-                    if let Some(mut ipv4_packet) = MutableIpv4Packet::new(&mut dev_buf[..len]) {
-                        let source = ipv4_packet.get_source();
-                        let destination = ipv4_packet.get_destination();
-
-                        // drop broadcast packets to prevent loops (broadcast storms)
-                        if destination.octets()[3] == 255 {
-                            trace!(
-                                "Dropping broadcast packet to prevent loop: src={} dst={}",
-                                source,
-                                destination
-                            );
-                            continue;
-                        }
-
-                        if !matches!(
-                            ipv4_packet.get_next_level_protocol(),
-                            IpNextHeaderProtocols::Tcp | IpNextHeaderProtocols::Udp | IpNextHeaderProtocols::Icmp
-                        ) {
-                            trace!("Ignored packet protocol: {:?}", ipv4_packet.get_next_level_protocol());
-                            continue;
-                        }
-
-                        // re-calculate and set checksum for the IP header
-                        ipv4_packet.set_checksum(checksum(&ipv4_packet.to_immutable()));
-
-                        // Check if this is a fragment
-                        // If offset > 0, it's a tail fragment (no L4 header).
-                        // If MF (MoreFragments) flag is set, it's a head fragment (checksum covers future data we don't have).
-                        let is_fragment = (ipv4_packet.get_flags() & Ipv4Flags::MoreFragments) != 0
-                            || ipv4_packet.get_fragment_offset() > 0;
-
-                        if !is_fragment {
-                            // ONLY calculate L4 checksums for whole packets
-                            match ipv4_packet.get_next_level_protocol() {
-                                IpNextHeaderProtocols::Tcp => {
-                                    if let Some(mut tcp_packet) =
-                                        MutableTcpPacket::new(ipv4_packet.payload_mut())
-                                    {
-                                        tcp_packet.set_checksum(tcp_ipv4_checksum(
-                                            &tcp_packet.to_immutable(),
-                                            &source,
-                                            &destination,
-                                        ));
+                            // Write path: Network -> TUN
+                            Some(pkg) = self.tun_rx.recv() => {
+                                if let Ok(packet) = pkg.to_ipv4_packet() {
+                                    let data = packet.packet();
+                                    if let Some(ipv4) = Ipv4Packet::new(data) {
+                                    match ipv4.get_next_level_protocol() {
+                                        IpNextHeaderProtocols::Tcp => {
+                                            if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+                                                let src_port = tcp.get_source();
+                                                let dst_port = tcp.get_destination();
+                                                debug!("dst={} dst-port={} src={} protocol={}: ip internal src-port={}", ipv4.get_destination(), dst_port, ipv4.get_source(), ipv4.get_next_level_protocol(), src_port);
+                                            }
+                                        }
+                                        IpNextHeaderProtocols::Udp => {
+                                            if let Some(udp) = UdpPacket::new(ipv4.payload()) {
+                                                let src_port = udp.get_source();
+                                                let dst_port = udp.get_destination();
+                                                debug!("dst={} dst-port={} src={} protocol={}: ip internal src-port={}", ipv4.get_destination(), dst_port, ipv4.get_source(), ipv4.get_next_level_protocol(), src_port);
+                                            }
+                                        }
+                                        IpNextHeaderProtocols::Icmp => {
+                                            if let Some(icmp) = IcmpPacket::new(ipv4.payload()) {
+                                                debug!("dst={} dst-port=N/A src={} protocol={}: ip internal src-port=N/A (icmp type={:?} code={:?})", ipv4.get_destination(), ipv4.get_source(), ipv4.get_next_level_protocol(), icmp.get_icmp_type(), icmp.get_icmp_code());
+                                            }
+                                        }
+                                        _ => {
+                                            debug!("dst={} dst-port=N/A src={} protocol={}: ip internal src-port=N/A", ipv4.get_destination(), ipv4.get_source(), ipv4.get_next_level_protocol());
+                                        }
                                     }
                                 }
-                                IpNextHeaderProtocols::Udp => {
-                                    if let Some(mut udp_packet) =
-                                        MutableUdpPacket::new(ipv4_packet.payload_mut())
-                                    {
-                                        udp_packet.set_checksum(udp_ipv4_checksum(
-                                            &udp_packet.to_immutable(),
-                                            &source,
-                                            &destination,
-                                        ));
+                                    if packet.get_destination() != self.ip {
+                                        warn!("Dropping packet destined to self to prevent loop: dst={}", self.ip);
+                                        continue;
+                                    }
+                                    match self.dev.send(data).await {
+                                        Ok(_) => {}
+                                        Err(e) => warn!("Failed to write to TUN: {}", e),
                                     }
                                 }
-                                IpNextHeaderProtocols::Icmp => {
-                                    if let Some(mut icmp_packet) =
-                                        MutableIcmpPacket::new(ipv4_packet.payload_mut())
-                                    {
-                                        icmp_packet.set_checksum(icmp_checksum(
-                                            &icmp_packet.to_immutable(),
-                                        ));
+                            }
+
+                            // Read path: TUN -> Network
+                            Ok(len) = self.dev.recv(&mut dev_buf) => {
+                                if let Some(mut ipv4_packet) = MutableIpv4Packet::new(&mut dev_buf[..len]) {
+                                    let source = ipv4_packet.get_source();
+                                    let destination = ipv4_packet.get_destination();
+
+                                    // drop broadcast packets to prevent loops (broadcast storms)
+                                    if destination.octets()[3] == 255 {
+                                        trace!(
+                                            "Dropping broadcast packet to prevent loop: src={} dst={}",
+                                            source,
+                                            destination
+                                        );
+                                        continue;
                                     }
+
+                                    if !matches!(
+                                        ipv4_packet.get_next_level_protocol(),
+                                        IpNextHeaderProtocols::Tcp | IpNextHeaderProtocols::Udp | IpNextHeaderProtocols::Icmp
+                                    ) {
+                                        trace!("Ignored packet protocol: {:?}", ipv4_packet.get_next_level_protocol());
+                                        continue;
+                                    }
+
+                                    // re-calculate and set checksum for the IP header
+                                    ipv4_packet.set_checksum(checksum(&ipv4_packet.to_immutable()));
+
+                                    // Check if this is a fragment
+                                    // If offset > 0, it's a tail fragment (no L4 header).
+                                    // If MF (MoreFragments) flag is set, it's a head fragment (checksum covers future data we don't have).
+                                    let is_fragment = (ipv4_packet.get_flags() & Ipv4Flags::MoreFragments) != 0
+                                        || ipv4_packet.get_fragment_offset() > 0;
+
+                                    if !is_fragment {
+                                        // ONLY calculate L4 checksums for whole packets
+                                        match ipv4_packet.get_next_level_protocol() {
+                                            IpNextHeaderProtocols::Tcp => {
+                                                if let Some(mut tcp_packet) =
+                                                    MutableTcpPacket::new(ipv4_packet.payload_mut())
+                                                {
+                                                    tcp_packet.set_checksum(tcp_ipv4_checksum(
+                                                        &tcp_packet.to_immutable(),
+                                                        &source,
+                                                        &destination,
+                                                    ));
+                                                }
+                                            }
+                                            IpNextHeaderProtocols::Udp => {
+                                                if let Some(mut udp_packet) =
+                                                    MutableUdpPacket::new(ipv4_packet.payload_mut())
+                                                {
+                                                    udp_packet.set_checksum(udp_ipv4_checksum(
+                                                        &udp_packet.to_immutable(),
+                                                        &source,
+                                                        &destination,
+                                                    ));
+                                                }
+                                            }
+                                            IpNextHeaderProtocols::Icmp => {
+                                                if let Some(mut icmp_packet) =
+                                                    MutableIcmpPacket::new(ipv4_packet.payload_mut())
+                                                {
+                                                    icmp_packet.set_checksum(icmp_checksum(
+                                                        &icmp_packet.to_immutable(),
+                                                    ));
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                    if let Ok(pkg) = Ipv4Pkg::new(ipv4_packet.packet()) {
+                                        let start = Instant::now();
+                                        if let Err(e) = self.to_remote_writer.send(pkg).await {
+                                            warn!("Failed to forward packet from TUN to network: {}", e);
+                                        } else if start.elapsed() > Duration::from_millis(5) {
+                                            warn!("TUN->network backpressure: send blocked {} ms", start.elapsed().as_millis());
+                                        }
+                                    }
+                                } else {
+                                    warn!("Failed to parse packet from TUN");
                                 }
-                                _ => {}
+                            }
+
+                            _ = tokio::signal::ctrl_c() => {
+                                info!("Ctrl-C received, shutting down TunActor");
+                                break
                             }
                         }
-
-                        if let Ok(pkg) = Ipv4Pkg::new(ipv4_packet.packet()) {
-                            let start = Instant::now();
-                            if let Err(e) = self.to_remote_writer.send(pkg).await {
-                                warn!("Failed to forward packet from TUN to network: {}", e);
-                            } else if start.elapsed() > Duration::from_millis(5) {
-                                warn!("TUN->network backpressure: send blocked {} ms", start.elapsed().as_millis());
-                            }
-                        }
-                    } else {
-                        warn!("Failed to parse packet from TUN");
-                    }
-                }
-
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Ctrl-C received, shutting down TunActor");
-                    break
-                }
-            }
         }
         self.close().await?;
         Ok(())

@@ -7,9 +7,10 @@ use crate::DirectMessage;
 use actor_helper::{Action, ActorState, Handle, Receiver, act, act_ok};
 use anyhow::Result;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures_lite::StreamExt;
+use iroh::address_lookup::{AddressLookup, DnsAddressLookup};
 use iroh::endpoint::{Connection, VarInt};
-use iroh::{Endpoint, EndpointId, Watcher};
+use iroh::{Endpoint, EndpointAddr, EndpointId, Watcher};
 use tokio::sync::Mutex;
 use tokio::time::{self, Instant};
 use tracing::{debug, info, trace, warn};
@@ -57,6 +58,7 @@ struct ConnActor {
     // route_packet failed
     conn: Option<Connection>,
     conn_endpoint_id: EndpointId,
+    id: u64,
 
     external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
 
@@ -82,6 +84,10 @@ struct ConnActor {
 }
 
 impl Conn {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub async fn last_keep_alive(&self) -> Instant {
         let guard = self.last_keep_alive.lock().await;
         *guard
@@ -98,8 +104,10 @@ impl Conn {
     ) -> Result<Self> {
         let conn_state = Arc::new(Mutex::new(InnerConnState::Connecting));
         let last_keep_alive = Arc::new(Mutex::new(Instant::now()));
+        let id = rand::random();
         let (api, _) = Handle::spawn_with(
             ConnActor::new(
+                id,
                 external_sender,
                 conn.remote_id(),
                 false,
@@ -109,7 +117,7 @@ impl Conn {
             |mut actor, rx| async move { actor.run(rx).await },
         );
         let s = Self {
-            id: rand::random(),
+            id,
             api,
             conn_state,
             last_keep_alive,
@@ -141,8 +149,10 @@ impl Conn {
     ) -> Result<Self> {
         let conn_state = Arc::new(Mutex::new(InnerConnState::Connecting));
         let last_keep_alive = Arc::new(Mutex::new(Instant::now()));
+        let id = rand::random();
         let (api, _) = Handle::spawn_with(
             ConnActor::new(
+                id,
                 external_sender,
                 remote_endpoint_id,
                 true,
@@ -152,7 +162,7 @@ impl Conn {
             |mut actor, rx| async move { actor.run(rx).await },
         );
         let s = Self {
-            id: rand::random(),
+            id,
             api,
             conn_state,
             last_keep_alive,
@@ -164,9 +174,12 @@ impl Conn {
             }))
             .await?;
 
+        let endpoint_addr = resolve_addr(&endpoint, remote_endpoint_id).await;
+        info!("Connecting to EndpointAddr: {:?}", endpoint_addr);
+
         let conn = match tokio::time::timeout(
             CONNECTING_TIMEOUT,
-            endpoint.connect(remote_endpoint_id, crate::Direct::ALPN),
+            endpoint.connect(endpoint_addr, crate::Direct::ALPN),
         )
         .await
         {
@@ -314,8 +327,9 @@ impl ConnActor {
                         warn!("[PROBE-QUEUE] High Queue Len: {}", q_len);
                     }
                     debug!(
-                        "{} Conn stats: endpoint_id={} state={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
+                        "{}-{} Conn stats: endpoint_id={} state={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
                         if self.is_open_side { "[OPEN]" } else { "[ACCEPT]" },
+                        self.id,
                         self.conn_endpoint_id,
                         current_state,
                         self.rx_count.load(Ordering::Relaxed),
@@ -339,6 +353,7 @@ impl ConnActor {
 impl ConnActor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        id: u64,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
         conn_endpoint_id: EndpointId,
         is_open_side: bool,
@@ -346,6 +361,7 @@ impl ConnActor {
         last_keep_alive: Arc<Mutex<Instant>>,
     ) -> Self {
         Self {
+            id,
             external_sender,
             read_task: None,
             write_task: None,
@@ -708,5 +724,31 @@ async fn read_next_msg(conn: &Connection) -> Result<DirectMessage, ReadError> {
             "not meant for us: prefix={:X}",
             buf[0]
         )))
+    }
+}
+
+
+async fn resolve_addr(ep: &Endpoint, peer_id: EndpointId) -> EndpointAddr {
+    let dns = DnsAddressLookup::n0_dns()
+        .dns_resolver(ep.dns_resolver().unwrap().clone())
+        .build();
+
+    let relay_url = match dns.resolve(peer_id) {
+        None => None,
+        Some(stream) => {
+            // Take the first successful result
+            stream
+                .filter_map(|item|  item.ok())    // unwrap Result
+                .find_map(|item| 
+                    item.relay_urls().next().cloned()
+                )
+                .await
+        }
+    };
+
+    match relay_url {
+        Some(url) => EndpointAddr::new(peer_id)
+            .with_relay_url(url),
+        None => EndpointAddr::new(peer_id),
     }
 }

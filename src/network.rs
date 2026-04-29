@@ -1,18 +1,19 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use actor_helper::{Action, Handle, Receiver, act, act_ok};
 use anyhow::Result;
+use ipnet::Ipv4Net;
 use iroh::{
     Endpoint, EndpointId, SecretKey,
     endpoint::{
-        Connection, IdleTimeout, QuicTransportConfig, VarInt,
+        IdleTimeout, QuicTransportConfig, VarInt,
         transports::{AddrKind, TransportBias},
     },
-    protocol::ProtocolHandler,
 };
 use iroh_auth::Authenticator;
 
@@ -108,14 +109,39 @@ fn rustonbsd_relay() -> RelayConfig {
     }
 } */
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct DummyProtocol;
-impl ProtocolHandler for DummyProtocol {
-    async fn accept(&self, _conn: Connection) -> Result<(), iroh::protocol::AcceptError> {
-        Ok(())
+fn is_vpn_addr(ip: IpAddr) -> bool {
+    if let IpAddr::V4(v4) = ip {
+        let sub_net: Ipv4Net = "172.30.0.0/16".parse().unwrap();
+        return sub_net.contains(&v4);
     }
+    false
 }
+
+async fn bind_endpoint(endpoint_builder: iroh::endpoint::Builder) -> Result<Endpoint> {
+    let ifaces = if_addrs::get_if_addrs()?;
+    let mut builder = endpoint_builder.clear_ip_transports();
+    let mut bound_any = false;
+    for iface in ifaces {
+        let ip = iface.addr.ip();
+
+        if iface.is_loopback() || is_vpn_addr(ip) {
+            continue;
+        }
+
+        builder = builder.bind_addr((ip, 0))?;
+        bound_any = true;
+    }
+
+    if !bound_any {
+        builder = builder.bind_addr((Ipv4Addr::LOCALHOST, 0))?;
+    }
+
+    builder
+        .bind()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind endpoint: {}", e))
+}
+
 impl Network {
     pub async fn new(name: &str, password: &str) -> Result<Self> {
         Self::new_logs_dir(name, password, None).await
@@ -136,18 +162,20 @@ impl Network {
         //let relay_map = RelayMap::from_iter([rustonbsd_relay()]);
         //relay_map.extend(&iroh::defaults::prod::default_relay_map());
 
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            //.relay_mode(iroh::RelayMode::Custom(relay_map))
-            .hooks(auth.clone())
-            .secret_key(secret_key.clone())
-            .transport_config(transport_config(log_dir))
-            .transport_bias(
-                AddrKind::Relay,
-                TransportBias::primary() // → PathStatus::Available -> keep-alive pings
-                    .with_rtt_disadvantage(Duration::from_millis(500)), // direct still wins selection
-            )
-            .bind()
-            .await?;
+        let endpoint = bind_endpoint(
+            Endpoint::builder(iroh::endpoint::presets::N0)
+                //.relay_mode(iroh::RelayMode::Custom(relay_map))
+                .hooks(auth.clone())
+                .secret_key(secret_key.clone())
+                .transport_config(transport_config(log_dir))
+                .transport_bias(
+                    AddrKind::Relay,
+                    TransportBias::primary() // PathStatus::Available -> keep-alive pings
+                        .with_rtt_disadvantage(Duration::from_millis(500)), // direct still wins selection
+                ),
+        )
+        .await?;
+
         auth.set_endpoint(&endpoint).await;
         endpoint.online().await;
 

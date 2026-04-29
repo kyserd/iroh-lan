@@ -50,7 +50,7 @@ echo "  netem profile for degraded/rolling/simultaneous phases: delay ${NETEM_DE
 echo ""
 
 
-tc qdisc add dev eth0 root netem delay 300ms 100ms distribution normal loss 1.5% 2.5% reorder 0.5% 5% duplicate 0.1% corrupt 0.01% rate 10mbit
+#tc qdisc add dev eth0 root netem delay 300ms 100ms distribution normal loss 1.5% 2.5% reorder 0.5% 5% duplicate 0.1% corrupt 0.01% rate 10mbit
 #tc qdisc replace dev eth0 root netem delay 1200ms 400ms reorder 35% 50% loss 35% 10% rate 6mbit limit 4000
 
 collect_logs() {
@@ -241,14 +241,7 @@ get_peers_csv() {
 #NETEM_CORRUPT_PCT=0.5
 #NETEM_SLOT="100ms 500ms"
 
-NETEM_DELAY_MS=200   
-NETEM_JITTER_MS=150
-NETEM_LOSS="gemodel 3% 20% 100% 0%"
-NETEM_RATE=512kbit
-NETEM_REORDER_PCT=5  
-NETEM_DUP_PCT=2
-NETEM_CORRUPT_PCT=0.3
-NETEM_SLOT=""
+
 
 apply_netem_profile() {
     local profile="$1"
@@ -264,45 +257,7 @@ apply_netem_profile() {
 
             # Build the tc command piecewise so each feature
             # can be independently toggled via empty vars
-            local cmd="tc qdisc add dev eth0 root netem"
-
-            # Delay + jitter (normal distribution)
-            if [[ -n "$NETEM_DELAY_MS" ]]; then
-                cmd+=" delay ${NETEM_DELAY_MS}ms"
-                [[ -n "$NETEM_JITTER_MS" ]] && \
-                    cmd+=" ${NETEM_JITTER_MS}ms distribution normal"
-            fi
-
-            # Loss — supports both "gemodel p h k ..." and plain "%"
-            # Use NETEM_LOSS for gemodel, NETEM_LOSS_PCT for simple
-            if [[ -n "$NETEM_LOSS" ]]; then
-                cmd+=" loss ${NETEM_LOSS}"
-            elif [[ -n "$NETEM_LOSS_PCT" ]]; then
-                cmd+=" loss ${NETEM_LOSS_PCT}%"
-            fi
-
-            # Reorder
-            if [[ -n "$NETEM_REORDER_PCT" ]]; then
-                cmd+=" reorder ${NETEM_REORDER_PCT}%"
-                [[ -n "$NETEM_REORDER_CORR" ]] && \
-                    cmd+=" ${NETEM_REORDER_CORR}%"
-            fi
-
-            # Duplicate
-            [[ -n "$NETEM_DUP_PCT" ]] && \
-                cmd+=" duplicate ${NETEM_DUP_PCT}%"
-
-            # Corrupt
-            [[ -n "$NETEM_CORRUPT_PCT" ]] && \
-                cmd+=" corrupt ${NETEM_CORRUPT_PCT}%"
-
-            # Rate limiting
-            [[ -n "$NETEM_RATE" ]] && \
-                cmd+=" rate ${NETEM_RATE}"
-
-            # Slot (periodic outage windows)
-            [[ -n "$NETEM_SLOT" ]] && \
-                cmd+=" slot ${NETEM_SLOT}"
+            local cmd="tc qdisc add dev eth0 root netem delay 450ms 80ms distribution normal loss gemodel 1.6% 30% 100% 0% reorder 7% duplicate 3% corrupt 0.1% rate 384kbit"
 
             echo "[node${NODE_INDEX}] $cmd"
             eval "$cmd"
