@@ -36,8 +36,8 @@ pub struct KvEvent {
 ///
 /// * **Keys are the data**, every key is a plain `String` that encodes
 ///   whatever information you need (paths, ids, …).
-/// * **Values are timestamps**, on conflict the highest timestamp wins
-///   (simple last-writer-wins).
+/// * **Values are timestamps**, and each exact key is merged independently
+///   with simple last-writer-wins semantics.
 /// * Offers `query_all` / `query_prefix` à la iroh-docs.
 /// * Fully clonable, backed by `Arc<Mutex<BTreeMap>>`.
 ///
@@ -183,22 +183,6 @@ impl Kv {
 }
 
 impl Kv {
-    fn canonical_state_key(key: &str) -> String {
-        if let Some(rest) = key.strip_prefix("/assigned/ip/") {
-            let parts: Vec<&str> = rest.split('/').collect();
-            if parts.len() >= 2 {
-                return format!("/assigned/ip/{}/{}", parts[0], parts[1]);
-            }
-        }
-        if let Some(rest) = key.strip_prefix("/candidates/ip/") {
-            let parts: Vec<&str> = rest.split('/').collect();
-            if parts.len() >= 2 {
-                return format!("/candidates/ip/{}/{}", parts[0], parts[1]);
-            }
-        }
-        key.to_string()
-    }
-
     /// Apply a remote key.  Returns `true` if the store was actually updated
     /// (i.e. the incoming timestamp was strictly newer).
     async fn apply(&self, key: &str, timestamp: u64) -> bool {
@@ -214,18 +198,13 @@ impl Kv {
 
     /// Snapshot the entire store for a `State` broadcast.
     async fn snapshot(&self) -> Vec<(String, u64)> {
-        let store = self.inner.store.lock().await;
-        let mut latest = BTreeMap::<String, u64>::new();
-        for (key, &timestamp) in store.iter() {
-            let canonical = Self::canonical_state_key(key);
-            match latest.get(&canonical) {
-                Some(&existing) if existing >= timestamp => {}
-                _ => {
-                    latest.insert(canonical, timestamp);
-                }
-            }
-        }
-        latest.into_iter().collect()
+        self.inner
+            .store
+            .lock()
+            .await
+            .iter()
+            .map(|(key, &timestamp)| (key.clone(), timestamp))
+            .collect()
     }
 
     /// Broadcast a full state dump.
@@ -264,6 +243,8 @@ impl Kv {
 const JITTER_MIN_MS: u64 = 200;
 const JITTER_MAX_MS: u64 = 2_000;
 const PERIODIC_SYNC_SECS: u64 = 30;
+const INITIAL_PERIODIC_SYNC_SECS: u64 = 2;
+const INITIAL_PERIOD_LENGTH_SECS: u64 = 30;
 const DIAGNOSTIC_LOG_SECS: u64 = 10;
 const PEER_DISCONNECT_BACKOFF_INIT_SECS: u64 = 2;
 const PEER_DISCONNECT_BACKOFF_INC_SECS: u64 = 2;
@@ -286,6 +267,9 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     let mut periodic = tokio::time::interval(Duration::from_secs(PERIODIC_SYNC_SECS));
     periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut initial_tick = tokio::time::interval(Duration::from_secs(INITIAL_PERIODIC_SYNC_SECS));
+    initial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut diagnostics = tokio::time::interval(Duration::from_secs(DIAGNOSTIC_LOG_SECS));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -298,6 +282,7 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     // On startup, schedule an initial state broadcast so any existing peers
     // learn about keys we may have inserted before the worker started.
     schedule_state(&mut state_timer, &mut state_pending);
+    let started = Instant::now();
     loop {
         tokio::select! {
             event = receiver.next() => {
@@ -346,6 +331,12 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
             }
             _ = periodic.tick() => {
                 schedule_state(&mut state_timer, &mut state_pending);
+            }
+            _ = initial_tick.tick() => {
+                if started.elapsed() < Duration::from_secs(INITIAL_PERIOD_LENGTH_SECS) {
+                    debug!("[Kv] initial sync tick, scheduling state broadcast");
+                    schedule_now(&mut state_timer, &mut state_pending);
+                }
             }
             _ = diagnostics.tick() => {
                 let neighbors = receiver.neighbors().count();
@@ -410,6 +401,12 @@ fn schedule_state(timer: &mut Pin<Box<tokio::time::Sleep>>, pending: &mut bool) 
         .reset(tokio::time::Instant::now() + Duration::from_millis(jitter));
     *pending = true;
     trace!("[Kv] State broadcast scheduled in {}ms", jitter);
+}
+
+fn schedule_now(timer: &mut Pin<Box<tokio::time::Sleep>>, pending: &mut bool) {
+    timer.as_mut().reset(tokio::time::Instant::now());
+    *pending = true;
+    trace!("[Kv] State broadcast scheduled immediately");
 }
 
 /// Parse and apply one incoming gossip message.

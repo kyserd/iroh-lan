@@ -5,9 +5,7 @@ use std::{
 };
 
 use iroh_gossip::net::Gossip;
-use iroh_topic_tracker::{
-    TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle,
-};
+use iroh_topic_tracker::{TopicDiscoveryConfig, TopicDiscoveryExt, TopicDiscoveryHandle};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -74,14 +72,13 @@ impl Builder {
         topic_hasher.update(&secret_initials);
         let topic_hash: [u8; 32] = topic_hasher.finalize()[..32].try_into()?;
 
-        let topic_discovery_config =
-            TopicDiscoveryConfig::builder(endpoint.clone())
-                .connection_timeout(Duration::from_secs(30))
-                .announce_interval(Duration::from_secs(15 * 60))
-                .first_connected_duration(Some(Duration::from_secs(60)))
-                .discovery_interval_first_connected(Duration::from_secs(4))
-                .dht_retries(None)
-                .build();
+        let topic_discovery_config = TopicDiscoveryConfig::builder(endpoint.clone())
+            .connection_timeout(Duration::from_secs(30))
+            .announce_interval(Duration::from_secs(15 * 60))
+            .first_connected_duration(Some(Duration::from_secs(60)))
+            .discovery_interval_first_connected(Duration::from_secs(4))
+            .dht_retries(None)
+            .build();
         let (gossip_sender, gossip_receiver, topic_handle) = loop {
             if let Ok((gossip_sender, gossip_receiver, topic_handle)) = gossip
                 .subscribe_with_discovery_joined(
@@ -142,7 +139,7 @@ struct RouterActor {
 
     pub my_ip: RouterIp,
 
-    assignments: BTreeMap<Ipv4Addr, IpAssignment>,
+    assignments: BTreeMap<Ipv4Addr, BTreeMap<EndpointId, IpAssignment>>,
     candidates: BTreeMap<Ipv4Addr, BTreeMap<EndpointId, IpCandidate>>,
     startup_entries: BTreeSet<EndpointId>,
 }
@@ -306,7 +303,10 @@ impl RouterActor {
             }
         } else if key.starts_with(&assigned_prefix) {
             if let Ok(ip_assignment) = decode_ip_assignment(key, timestamp) {
-                self.assignments.insert(ip_assignment.ip, ip_assignment);
+                self.assignments
+                    .entry(ip_assignment.ip)
+                    .or_default()
+                    .insert(ip_assignment.endpoint_id, ip_assignment);
             }
         } else if key.starts_with(&candidate_prefix)
             && let Ok(ip_candidate) = decode_ip_candidate(key, timestamp)
@@ -464,6 +464,16 @@ impl RouterActor {
         self.startup_entries.len() >= 2
     }
 
+    fn choose_assignment_winner<'a, I>(&self, assignments: I) -> Option<IpAssignment>
+    where
+        I: IntoIterator<Item = &'a IpAssignment>,
+    {
+        assignments
+            .into_iter()
+            .max_by_key(|assignment| (assignment.endpoint_id, assignment.last_updated))
+            .cloned()
+    }
+
     fn read_all_ip_assignments(&self, filter_stale: bool) -> Result<Vec<IpAssignment>> {
         if !self.is_initialized() {
             warn!(
@@ -475,8 +485,13 @@ impl RouterActor {
         Ok(self
             .assignments
             .values()
-            .filter(|assignment| !filter_stale || !assignment.is_stale())
-            .cloned()
+            .filter_map(|assignments| {
+                self.choose_assignment_winner(
+                    assignments
+                        .values()
+                        .filter(|assignment| !filter_stale || !assignment.is_stale()),
+                )
+            })
             .collect::<Vec<_>>())
     }
 
@@ -506,14 +521,33 @@ impl RouterActor {
             );
             bail!("[Kv] not initialized yet");
         }
-        let mut assignments = self
-            .assignments
-            .iter()
-            .filter(|(_, assignment)| !filter_stale || !assignment.is_stale())
-            .map(|(_, assignment)| assignment)
-            .collect::<Vec<_>>();
-        assignments.sort_by_key(|a| a.last_updated);
-        Ok(assignments.into_iter().rev().find(|a| a.ip == ip).cloned())
+        Ok(self.assignments.get(&ip).and_then(|assignments| {
+            self.choose_assignment_winner(
+                assignments
+                    .values()
+                    .filter(|assignment| !filter_stale || !assignment.is_stale()),
+            )
+        }))
+    }
+
+    fn read_ip_assignments(&self, ip: Ipv4Addr, filter_stale: bool) -> Result<Vec<IpAssignment>> {
+        if !self.is_initialized() {
+            warn!(
+                "[Kv] read_ip_assignments called before initialized. Startup entries count: {}",
+                self.startup_entries.len()
+            );
+            bail!("[Kv] not initialized yet");
+        }
+        let mut assignments = match self.assignments.get(&ip) {
+            Some(assignments) => assignments
+                .values()
+                .filter(|assignment| !filter_stale || !assignment.is_stale())
+                .cloned()
+                .collect::<Vec<_>>(),
+            None => vec![],
+        };
+        assignments.sort_by_key(|assignment| (assignment.endpoint_id, assignment.last_updated));
+        Ok(assignments)
     }
 
     // Candidate IPs
@@ -671,7 +705,23 @@ impl RouterActor {
                 let next_ip = self.get_next_ip().await?;
                 info!("Trying to acquire IP candidate: {}", next_ip);
 
-                if self.read_ip_assignment(next_ip, true)?.is_some() {
+                if self
+                    .read_ip_candidates(next_ip, true)?
+                    .iter()
+                    .any(|c| c.endpoint_id != self.endpoint_id)
+                {
+                    debug!(
+                        "IP {} already has candidates from other nodes. Skipping candidate write.",
+                        next_ip
+                    );
+                    return Ok(false);
+                }
+
+                if self
+                    .read_ip_assignments(next_ip, true)?
+                    .iter()
+                    .any(|a| a.endpoint_id != self.endpoint_id)
+                {
                     debug!(
                         "IP {} already assigned to another node. Skipping candidate write.",
                         next_ip
@@ -694,11 +744,7 @@ impl RouterActor {
                 );
                 if let Ok(candidates) = self.read_ip_candidates(ip_candidate.ip, true)
                     && candidates.iter().any(|c| {
-                        c.endpoint_id != self.endpoint_id
-                            && (self.endpoint_id < c.endpoint_id
-                                || (self.endpoint_id >= c.endpoint_id
-                                    && current_time().saturating_sub(c.last_updated)
-                                        > CANDIDATE_PHASE_DURATION.as_secs()))
+                        c.endpoint_id != self.endpoint_id && c.endpoint_id > self.endpoint_id
                     })
                 {
                     warn!(
@@ -709,17 +755,17 @@ impl RouterActor {
                     return Ok(false);
                 }
 
-                if let Ok(Some(assignment)) = self.read_ip_assignment(ip_candidate.ip, true)
-                    && assignment.endpoint_id != self.endpoint_id
-                    && (self.endpoint_id < assignment.endpoint_id
-                        || (self.endpoint_id >= assignment.endpoint_id
-                            && current_time().saturating_sub(assignment.last_updated)
-                                > VERIFY_IP_DURATION.as_secs()))
+                if let Ok(assignments) = self.read_ip_assignments(ip_candidate.ip, true)
+                    && assignments
+                        .iter()
+                        .any(|assignment| assignment.endpoint_id != self.endpoint_id)
                 {
-                    warn!(
-                        "IP {} got assigned to {} during acquisition wait. Aborting.",
-                        ip_candidate.ip, assignment.endpoint_id
-                    );
+                    if let Some(assignment) = self.read_ip_assignment(ip_candidate.ip, true)? {
+                        warn!(
+                            "IP {} got assigned to {} during acquisition wait. Aborting.",
+                            ip_candidate.ip, assignment.endpoint_id
+                        );
+                    }
                     self.my_ip = RouterIp::NoIp;
                     return Ok(false);
                 }
@@ -784,6 +830,37 @@ impl RouterActor {
                 Ok(false)
             }
             RouterIp::VerifyingIp(ip, start_time) => {
+
+                // if bigger candidate appears no ip
+                if let Ok(candidates) = self.read_ip_candidates(ip, true)
+                    && candidates.iter().any(|c| {
+                        c.endpoint_id != self.endpoint_id && c.endpoint_id > self.endpoint_id
+                    })
+                {
+                    warn!(
+                        "Conflict detected for {:?} during verification wait. Aborting.",
+                        ip
+                    );
+                    self.my_ip = RouterIp::NoIp;
+                    return Ok(false);
+                }
+
+                // if any bigger assignment appears no ip
+                if let Ok(assignments) = self.read_ip_assignments(ip, true)
+                    && assignments
+                        .iter()
+                        .any(|assignment| assignment.endpoint_id != self.endpoint_id && assignment.endpoint_id > self.endpoint_id)
+                {
+                    if let Some(assignment) = self.read_ip_assignment(ip, true)? {
+                        warn!(
+                            "IP {} got assigned to {} during verification wait. Aborting.",
+                            ip, assignment.endpoint_id
+                        );
+                    }
+                    self.my_ip = RouterIp::NoIp;
+                    return Ok(false);
+                }
+
                 // Wait 2 seconds to ensure propagation
                 if start_time.elapsed() > VERIFY_IP_DURATION {
                     trace!("Verifying IP assignment logic for {}", ip);
@@ -801,6 +878,10 @@ impl RouterActor {
                             self.my_ip = RouterIp::NoIp;
                         }
                     }
+                } else {
+                    // write our ip assignment so others can observe, we see if there is a conflict
+                    self.write_ip_assignment(ip, self.endpoint_id, false)
+                        .await?;
                 }
                 Ok(false)
             }

@@ -18,7 +18,7 @@ use crate::{
 };
 
 const MAX_RECONNECT_ATTEMPTS: usize = 50;
-const CONN_COUNT_TARGET: usize = 6;
+const CONN_COUNT_TARGET: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Direct {
