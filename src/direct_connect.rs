@@ -8,12 +8,12 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, atomic::AtomicUsize},
 };
-use tokio::{sync::Mutex, time::Instant};
-use tracing::{debug, error, info, trace};
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     Router, RouterIp,
-    connection::{Conn, InnerConnState},
+    connection::{Conn, ConnLiveness, ConnSnapshot, InnerConnState},
     local_networking::Ipv4Pkg,
 };
 
@@ -53,7 +53,23 @@ struct DirectActor {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum DirectMessage {
     IpPacket(Ipv4Pkg),
-    IDontLikeWarnings,
+    IDontLikeWarnings(Vec<u8>),
+}
+
+impl DirectMessage {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::IpPacket(_) => "ip",
+            Self::IDontLikeWarnings(_) => "keepalive",
+        }
+    }
+
+    pub fn payload_len(&self) -> usize {
+        match self {
+            Self::IpPacket(pkg) => pkg.as_slice().len(),
+            Self::IDontLikeWarnings(_) => 0,
+        }
+    }
 }
 
 impl Direct {
@@ -168,7 +184,12 @@ impl DirectActor {
                 for conn in guard.iter_mut() {
                     if !conn.is_alive().await
                     {
-                        debug!("Open connection to {} is no longer alive, dropping", id);
+                        let snapshot = conn
+                            .snapshot()
+                            .await
+                            .map(|snapshot| snapshot.to_string())
+                            .unwrap_or_else(|| format!("conn_actor_id={} snapshot=unavailable", conn.id()));
+                        debug!("iroh-pool-drop-dead peer={} snapshot=[{}]", id, snapshot);
                         conn.drop().await;
                         tbd.push(conn.id());
                         peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -212,9 +233,14 @@ impl DirectActor {
                 Ok(new_conn) => {
                     debug!("Successfully established connection to {}", peer_id);
                     if new_conn.is_alive().await {
+                        let snapshot = new_conn
+                            .snapshot()
+                            .await
+                            .map(|snapshot| snapshot.to_string())
+                            .unwrap_or_else(|| format!("conn_actor_id={} snapshot=unavailable", new_conn.id()));
                         let mut guard = peer.conn_pool.lock().await;
                         guard.push(new_conn.clone());
-                        info!("New connection to {} is now open", peer_id);
+                        info!("iroh-pool-add-open peer={} snapshot=[{}]", peer_id, snapshot);
                     } else {
                         debug!(
                             "New connection to {} is not alive after establishment, dropping",
@@ -272,8 +298,14 @@ impl DirectActor {
             Ok(remote_conn) => {
                 debug!("Successfully accepted connection from {}", remote_id);
                 if remote_conn.is_alive().await {
+                    let snapshot = remote_conn
+                        .snapshot()
+                        .await
+                        .map(|snapshot| snapshot.to_string())
+                        .unwrap_or_else(|| format!("conn_actor_id={} snapshot=unavailable", remote_conn.id()));
                     let mut guard = peer.conn_pool.lock().await;
                     guard.push(remote_conn.clone());
+                    info!("iroh-pool-add-accept peer={} snapshot=[{}]", remote_id, snapshot);
                 } else {
                     debug!(
                         "Accepted connection from {} is not alive after establishment, dropping",
@@ -306,23 +338,63 @@ impl DirectActor {
         match self.peers.entry(to) {
             Entry::Occupied(entry) => {
                 let peer = entry.get();
+                let msg_kind = pkg.kind_name();
+                let payload_len = pkg.payload_len();
 
-                let mut attempt_order = Vec::new();
+                let mut attempt_order: Vec<(u8, u128, Conn, ConnSnapshot)> = Vec::new();
+                let mut pool_snapshots = Vec::new();
                 let guard = peer.conn_pool.lock().await;
                 for conn in guard.iter() {
-                    if conn.is_alive().await {
-                        let keep_alive = conn.last_keep_alive().await;
-                        attempt_order.push((keep_alive, conn));
+                    if let Some(snapshot) = conn.snapshot().await {
+                        pool_snapshots.push(snapshot.to_string());
+                        if snapshot.liveness != ConnLiveness::Dead {
+                            let priority = match snapshot.liveness {
+                                ConnLiveness::Usable => 0,
+                                ConnLiveness::Suspect => 1,
+                                ConnLiveness::Dead => 2,
+                            };
+                            attempt_order.push((priority, snapshot.idle_for_ms, conn.clone(), snapshot));
+                        }
                     }
                 }
-                attempt_order.sort_by_key(|(v,_)| Instant::now().duration_since(*v));
+                drop(guard);
+                attempt_order.sort_by_key(|(priority, idle_for_ms, _, _)| (*priority, *idle_for_ms));
 
+                debug!(
+                    "iroh-route-pool peer={} kind={} payload_bytes={} pool_size={} open_candidates={} snapshots=[{}]",
+                    to,
+                    msg_kind,
+                    payload_len,
+                    pool_snapshots.len(),
+                    attempt_order.len(),
+                    if pool_snapshots.is_empty() {
+                        "none".to_string()
+                    } else {
+                        pool_snapshots.join(" || ")
+                    }
+                );
 
-                for (_, conn) in attempt_order {
+                for (_, idle_for_ms, conn, snapshot) in attempt_order {
+                    debug!(
+                        "iroh-route-selected peer={} kind={} payload_bytes={} attempted_liveness={} attempted_idle_for_ms={} snapshot=[{}]",
+                        to,
+                        msg_kind,
+                        payload_len,
+                        snapshot.liveness,
+                        idle_for_ms,
+                        snapshot
+                    );
                     if conn.write(pkg.clone()).await.is_ok()
                     {
                         return Ok(());
                     }
+                    warn!(
+                        "iroh-route-write-failed peer={} kind={} payload_bytes={} snapshot=[{}]",
+                        to,
+                        msg_kind,
+                        payload_len,
+                        snapshot
+                    );
                 }
                 error!("Failed to write packet to peer {}: no open connections", to);
                 Err(anyhow::anyhow!(

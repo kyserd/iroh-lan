@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
@@ -21,9 +21,11 @@ const MAX_SENDER_QUEUE: usize = 50_000;
 const WRITE_CHANNEL_CAP: usize = 8_192;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_WARN_LEN: usize = 10_000;
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECTING_TIMEOUT: Duration = Duration::from_secs(20);
 const DATAGRAM_PREFIX: u8 = 0x43;
+const MAX_CONSECUTIVE_READ_TIMEOUTS: usize = 3;
+const MAX_CONSECUTIVE_WRITE_TIMEOUTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InnerConnState {
@@ -32,12 +34,188 @@ pub enum InnerConnState {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConnLiveness {
+    Usable,
+    Suspect,
+    Dead,
+}
+
+impl Display for ConnLiveness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usable => write!(f, "usable"),
+            Self::Suspect => write!(f, "suspect"),
+            Self::Dead => write!(f, "dead"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConnHealthWindow {
+    last_rx_count: usize,
+    last_tx_count: usize,
+    last_udp_rx: u64,
+    last_udp_tx: u64,
+    last_lost: u64,
+    consecutive_read_timeouts: usize,
+    consecutive_write_timeouts: usize,
+    no_active_paths: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnPathSnapshot {
+    pub path_id: String,
+    pub remote_addr: String,
+    pub is_selected: bool,
+    pub is_closed: bool,
+    pub rtt_ms: Option<u128>,
+    pub lost_packets: Option<u64>,
+    pub black_holes_detected: Option<u64>,
+    pub current_mtu: Option<u16>,
+    pub udp_tx_datagrams: Option<u64>,
+    pub udp_rx_datagrams: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnSnapshot {
+    pub conn_actor_id: u64,
+    pub peer: EndpointId,
+    pub quic_stable_id: Option<usize>,
+    pub side: &'static str,
+    pub state: InnerConnState,
+    pub liveness: ConnLiveness,
+    pub idle_for_ms: u128,
+    pub rx_count: usize,
+    pub tx_count: usize,
+    pub queue_len: usize,
+    pub write_timeouts: usize,
+    pub consecutive_write_errors: usize,
+    pub consecutive_read_timeouts: usize,
+    pub consecutive_write_timeouts: usize,
+    pub no_active_paths: bool,
+    pub dropped_packets: usize,
+    pub total_lost_packets: Option<u64>,
+    pub total_udp_tx_datagrams: Option<u64>,
+    pub total_udp_rx_datagrams: Option<u64>,
+    pub selected_path: Option<ConnPathSnapshot>,
+    pub paths: Vec<ConnPathSnapshot>,
+}
+
+impl fmt::Display for ConnPathSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "path_id={} remote_addr={} selected={} closed={} rtt_ms={} lost_packets={} black_holes={} mtu={} udp_tx_dgrams={} udp_rx_dgrams={}",
+            self.path_id,
+            self.remote_addr,
+            self.is_selected,
+            self.is_closed,
+            self.rtt_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.lost_packets
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.black_holes_detected
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.current_mtu
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.udp_tx_datagrams
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.udp_rx_datagrams
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    }
+}
+
+impl fmt::Display for ConnSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let selected_path = self
+            .selected_path
+            .as_ref()
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let all_paths = if self.paths.is_empty() {
+            "none".to_string()
+        } else {
+            self.paths
+                .iter()
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+
+        write!(
+            f,
+            "conn_actor_id={} peer={} quic_stable_id={} side={} state={:?} liveness={} idle_for_ms={} rx_count={} tx_count={} queue_len={} write_timeouts={} consecutive_write_errors={} consecutive_read_timeouts={} consecutive_write_timeouts={} no_active_paths={} dropped_packets={} total_lost_packets={} total_udp_tx_dgrams={} total_udp_rx_dgrams={} selected_path=[{}] paths=[{}]",
+            self.conn_actor_id,
+            self.peer,
+            self.quic_stable_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.side,
+            self.state,
+            self.liveness,
+            self.idle_for_ms,
+            self.rx_count,
+            self.tx_count,
+            self.queue_len,
+            self.write_timeouts,
+            self.consecutive_write_errors,
+            self.consecutive_read_timeouts,
+            self.consecutive_write_timeouts,
+            self.no_active_paths,
+            self.dropped_packets,
+            self.total_lost_packets
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.total_udp_tx_datagrams
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.total_udp_rx_datagrams
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            selected_path,
+            all_paths
+        )
+    }
+}
+
+fn side_label(is_open_side: bool) -> &'static str {
+    if is_open_side { "open" } else { "accept" }
+}
+
+fn snapshot_paths(conn: &Connection) -> Vec<ConnPathSnapshot> {
+    conn.to_info()
+        .paths()
+        .into_iter()
+        .map(|path| {
+            let stats = path.stats();
+            ConnPathSnapshot {
+                path_id: format!("{:?}", path.id()),
+                remote_addr: format!("{:?}", path.remote_addr()),
+                is_selected: path.is_selected(),
+                is_closed: path.is_closed(),
+                rtt_ms: path.rtt().map(|value| value.as_millis()),
+                lost_packets: stats.as_ref().map(|value| value.lost_packets),
+                black_holes_detected: stats.as_ref().map(|value| value.black_holes_detected),
+                current_mtu: stats.as_ref().map(|value| value.current_mtu),
+                udp_tx_datagrams: stats.as_ref().map(|value| value.udp_tx.datagrams),
+                udp_rx_datagrams: stats.as_ref().map(|value| value.udp_rx.datagrams),
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct Conn {
     api: Handle<ConnActor, anyhow::Error>,
     id: u64,
-    conn_state: Arc<Mutex<InnerConnState>>,
-    last_keep_alive: Arc<Mutex<Instant>>,
 }
 
 impl Eq for Conn {}
@@ -81,6 +259,7 @@ struct ConnActor {
     is_open_side: bool,
     conn_state: Arc<Mutex<InnerConnState>>,
     last_keep_alive: Arc<Mutex<Instant>>,
+    health: Arc<Mutex<ConnHealthWindow>>,
 }
 
 impl Conn {
@@ -88,14 +267,18 @@ impl Conn {
         self.id
     }
 
-    pub async fn last_keep_alive(&self) -> Instant {
-        let guard = self.last_keep_alive.lock().await;
-        *guard
+    pub async fn is_alive(&self) -> bool {
+        matches!(
+            self.snapshot().await.map(|snapshot| snapshot.liveness),
+            Some(ConnLiveness::Usable | ConnLiveness::Suspect)
+        )
     }
 
-    pub async fn is_alive(&self) -> bool {
-        let state = self.conn_state.lock().await;
-        *state == InnerConnState::Open
+    pub async fn snapshot(&self) -> Option<ConnSnapshot> {
+        self.api
+            .call(act_ok!(actor => async move { actor.snapshot().await }))
+            .await
+            .ok()
     }
 
     pub async fn accept_connection(
@@ -119,8 +302,6 @@ impl Conn {
         let s = Self {
             id,
             api,
-            conn_state,
-            last_keep_alive,
         };
         let self_handle = s.api.clone();
         s.api
@@ -164,8 +345,6 @@ impl Conn {
         let s = Self {
             id,
             api,
-            conn_state,
-            last_keep_alive,
         };
         let self_handle = s.api.clone();
         s.api
@@ -304,7 +483,7 @@ impl ConnActor {
                         continue;
                     }
                     if let Some(tx) = &self.write_tx {
-                        match tx.try_send(DirectMessage::IDontLikeWarnings) {
+                        match tx.try_send(DirectMessage::IDontLikeWarnings(rand::random::<[u8; 128]>().to_vec())) {
                             Ok(_) => {
                                 info!("Sent keepalive, i am {}", if self.is_open_side { "OPEN" } else { "ACCEPT" });
                                 let new_len = self.queue_len.fetch_add(1, Ordering::Relaxed) + 1;
@@ -380,6 +559,7 @@ impl ConnActor {
             is_open_side,
             conn_state,
             last_keep_alive,
+            health: Arc::new(Mutex::new(ConnHealthWindow::default())),
         }
     }
 
@@ -478,8 +658,10 @@ impl ConnActor {
             conn.clone(),
             self.external_sender.clone(),
             self_handle.clone(),
+            self.id,
             rx_count,
             self.last_keep_alive.clone(),
+            self.health.clone(),
         )));
 
         info!("Spawning write task for incoming connection");
@@ -491,22 +673,49 @@ impl ConnActor {
             conn.clone(),
             rx,
             self_handle.clone(),
+            self.id,
             self.queue_len.clone(),
             "main",
             tx_count,
             write_timeouts,
+            self.health.clone(),
         )));
         self.write_tx = Some(tx.clone());
 
         self.connected_task = Some(tokio::spawn(connection_watcher_loop(
             conn.clone(),
             self_handle.clone(),
+            self.id,
+            side_label(self.is_open_side),
+            self.health.clone(),
         )));
 
         self.conn = Some(conn);
+        if self.conn.is_some() {
+            let snapshot = self.snapshot().await;
+            info!(
+                "iroh-conn-established {}",
+                snapshot
+            );
+            debug!(
+                "iroh-qlog-filename-hint peer={} conn_actor_id={} quic_stable_id={} side={} qlog_filename_format=<prefix><unix_ms>-<initial_dst_cid>-<{}>.qlog",
+                self.conn_endpoint_id,
+                self.id,
+                snapshot
+                    .quic_stable_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                snapshot.side,
+                snapshot.side
+            );
+        }
         self.consecutive_write_errors.store(0, Ordering::Relaxed);
         self.rx_count.store(0, Ordering::Relaxed);
         self.tx_count.store(0, Ordering::Relaxed);
+        {
+            let mut health = self.health.lock().await;
+            *health = ConnHealthWindow::default();
+        }
 
         while let Some(msg) = self.sender_queue.pop_back() {
             match tx.try_send(msg) {
@@ -540,37 +749,213 @@ impl ConnActor {
 
         Ok(())
     }
+    pub async fn snapshot(&self) -> ConnSnapshot {
+        let state = self.conn_state.lock().await.clone();
+        let keep_alive = *self.last_keep_alive.lock().await;
+        let idle_for_ms = Instant::now().duration_since(keep_alive).as_millis();
+        let (quic_stable_id, selected_path, paths, total_lost_packets, total_udp_tx_datagrams, total_udp_rx_datagrams) =
+            if let Some(conn) = self.conn.as_ref() {
+                let paths = snapshot_paths(conn);
+                let selected_path = paths.iter().find(|path| path.is_selected).cloned();
+                let stats = conn.to_info().stats();
+                (
+                    Some(conn.stable_id()),
+                    selected_path,
+                    paths,
+                    stats.as_ref().map(|value| value.lost_packets),
+                    stats.as_ref().map(|value| value.udp_tx.datagrams),
+                    stats.as_ref().map(|value| value.udp_rx.datagrams),
+                )
+            } else {
+                (None, None, Vec::new(), None, None, None)
+            };
+
+        let rx_count = self.rx_count.load(Ordering::Relaxed);
+        let tx_count = self.tx_count.load(Ordering::Relaxed);
+        let write_timeouts = self.write_timeouts.load(Ordering::Relaxed);
+        let consecutive_write_errors = self.consecutive_write_errors.load(Ordering::Relaxed);
+        let dropped_packets = self.dropped_packets.load(Ordering::Relaxed);
+
+        let total_lost = total_lost_packets.unwrap_or(0);
+        let total_udp_tx = total_udp_tx_datagrams.unwrap_or(0);
+        let total_udp_rx = total_udp_rx_datagrams.unwrap_or(0);
+
+        let mut health = self.health.lock().await;
+        let rx_progress = rx_count > health.last_rx_count || total_udp_rx > health.last_udp_rx;
+        let tx_progress = tx_count > health.last_tx_count || total_udp_tx > health.last_udp_tx;
+        let loss_jump = total_lost > health.last_lost;
+
+        let liveness = classify_liveness(
+            state.clone(),
+            selected_path.as_ref(),
+            &paths,
+            rx_progress,
+            tx_progress,
+            loss_jump,
+            &health,
+        );
+
+        let snapshot = ConnSnapshot {
+            conn_actor_id: self.id,
+            peer: self.conn_endpoint_id,
+            quic_stable_id,
+            side: side_label(self.is_open_side),
+            state,
+            liveness,
+            idle_for_ms,
+            rx_count,
+            tx_count,
+            queue_len: self.queue_len.load(Ordering::Relaxed),
+            write_timeouts,
+            consecutive_write_errors,
+            consecutive_read_timeouts: health.consecutive_read_timeouts,
+            consecutive_write_timeouts: health.consecutive_write_timeouts,
+            no_active_paths: health.no_active_paths,
+            dropped_packets,
+            total_lost_packets,
+            total_udp_tx_datagrams,
+            total_udp_rx_datagrams,
+            selected_path,
+            paths,
+        };
+
+        health.last_rx_count = rx_count;
+        health.last_tx_count = tx_count;
+        health.last_udp_rx = total_udp_rx;
+        health.last_udp_tx = total_udp_tx;
+        health.last_lost = total_lost;
+
+        snapshot
+    }
 }
 
-async fn connection_watcher_loop(conn: Connection, api: Handle<ConnActor, anyhow::Error>) {
+fn classify_liveness(
+    state: InnerConnState,
+    selected_path: Option<&ConnPathSnapshot>,
+    paths: &[ConnPathSnapshot],
+    rx_progress: bool,
+    tx_progress: bool,
+    loss_jump: bool,
+    health: &ConnHealthWindow,
+) -> ConnLiveness {
+    if state != InnerConnState::Open {
+        return ConnLiveness::Dead;
+    }
+
+    if health.no_active_paths {
+        return ConnLiveness::Dead;
+    }
+
+    let has_open_path = paths.iter().any(|path| !path.is_closed);
+    if !has_open_path {
+        return ConnLiveness::Dead;
+    }
+
+    let has_selected_open_path = selected_path.is_some_and(|path| !path.is_closed);
+    let blackhole_seen = selected_path
+        .and_then(|path| path.black_holes_detected)
+        .unwrap_or(0)
+        > 0;
+
+    if has_selected_open_path && rx_progress {
+        return ConnLiveness::Usable;
+    }
+
+    if has_selected_open_path
+        && tx_progress
+        && health.consecutive_read_timeouts < MAX_CONSECUTIVE_READ_TIMEOUTS
+        && health.consecutive_write_timeouts < MAX_CONSECUTIVE_WRITE_TIMEOUTS
+        && !blackhole_seen
+    {
+        return ConnLiveness::Suspect;
+    }
+
+    if !has_selected_open_path && has_open_path && health.consecutive_read_timeouts < MAX_CONSECUTIVE_READ_TIMEOUTS {
+        return ConnLiveness::Suspect;
+    }
+
+    if health.consecutive_read_timeouts >= MAX_CONSECUTIVE_READ_TIMEOUTS
+        && !rx_progress
+        && (blackhole_seen
+            || loss_jump
+            || health.consecutive_write_timeouts >= MAX_CONSECUTIVE_WRITE_TIMEOUTS)
+    {
+        return ConnLiveness::Dead;
+    }
+
+    ConnLiveness::Suspect
+}
+
+async fn connection_watcher_loop(
+    conn: Connection,
+    api: Handle<ConnActor, anyhow::Error>,
+    conn_actor_id: u64,
+    side: &'static str,
+    health: Arc<Mutex<ConnHealthWindow>>,
+) {
     let mut watcher = conn.paths().stream();
     while let Some(update) = watcher.next().await {
-        debug!("Path update {}: {:?}", conn.remote_id(), update);
+        let path_snapshot = snapshot_paths(&conn)
+            .into_iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        debug!(
+            "iroh-path-update peer={} conn_actor_id={} quic_stable_id={} side={} update={:?} paths=[{}]",
+            conn.remote_id(),
+            conn_actor_id,
+            conn.stable_id(),
+            side,
+            update,
+            path_snapshot
+        );
         if !conn.to_info().is_alive() {
-            warn!("All paths abandoned: {}", conn.remote_id().to_string());
+            warn!(
+                "iroh-path-abandoned peer={} conn_actor_id={} quic_stable_id={} side={} paths=[{}]",
+                conn.remote_id(),
+                conn_actor_id,
+                conn.stable_id(),
+                side,
+                path_snapshot
+            );
             break;
         }
     }
 
     // all paths abandoned, connection is dead
-    warn!("No active paths: {}", conn.remote_id().to_string());
+    warn!(
+        "iroh-no-active-paths peer={} conn_actor_id={} quic_stable_id={} side={}",
+        conn.remote_id(),
+        conn_actor_id,
+        conn.stable_id(),
+        side
+    );
+    {
+        let mut health = health.lock().await;
+        health.no_active_paths = true;
+    }
     let _ = api.call(act_ok!(actor => actor.close())).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_loop_bounded(
     conn: Connection,
     mut rx: tokio::sync::mpsc::Receiver<DirectMessage>,
     api: Handle<ConnActor, anyhow::Error>,
+    conn_actor_id: u64,
     queue_len: Arc<std::sync::atomic::AtomicUsize>,
     label: &'static str,
     tx_count: Arc<AtomicUsize>,
     write_timeout: Arc<AtomicUsize>,
+    health: Arc<Mutex<ConnHealthWindow>>,
 ) {
     info!("Write task started ({})", label);
     while let Some(msg) = rx.recv().await {
         let _ = queue_len.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
         });
+        let msg_kind = msg.kind_name();
+        let payload_len = msg.payload_len();
         let bytes = match postcard::to_stdvec(&msg) {
             Ok(b) => b,
             Err(e) => {
@@ -580,24 +965,57 @@ async fn write_loop_bounded(
         };
         let mut buf = vec![DATAGRAM_PREFIX];
         buf.extend_from_slice(&bytes);
+        let datagram_len = buf.len();
 
         let mut retries = 0;
         while retries < 1 {
+            debug!(
+                "iroh-send peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
+                conn.remote_id(),
+                conn_actor_id,
+                conn.stable_id(),
+                msg_kind,
+                payload_len,
+                datagram_len
+            );
             match time::timeout(
                 KEEPALIVE_INTERVAL * 5,
-                conn.send_datagram_wait(Bytes::from(buf.clone())),
+                async { conn.send_datagram(Bytes::from(buf.clone())) },
             )
             .await
             {
-                Ok(Ok(())) => break,
+                Ok(Ok(())) => {
+                    {
+                        let mut health = health.lock().await;
+                        health.consecutive_write_timeouts = 0;
+                    }
+                    debug!(
+                        "iroh-send-ok peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
+                        conn.remote_id(),
+                        conn_actor_id,
+                        conn.stable_id(),
+                        msg_kind,
+                        payload_len,
+                        datagram_len
+                    );
+                    break;
+                }
                 Ok(Err(err)) => {
                     warn!("Write error (frame): {}, {:?}, retrying...", err, err);
+                    {
+                        let mut health = health.lock().await;
+                        health.consecutive_write_timeouts = health.consecutive_write_timeouts.saturating_add(1);
+                    }
                     retries += 1;
                     time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(_) => {
                     warn!("Write error timeout (frame)");
                     write_timeout.fetch_add(1, Ordering::SeqCst);
+                    {
+                        let mut health = health.lock().await;
+                        health.consecutive_write_timeouts = health.consecutive_write_timeouts.saturating_add(1);
+                    }
                     time::sleep(Duration::from_millis(100)).await;
                     break;
                 }
@@ -605,8 +1023,13 @@ async fn write_loop_bounded(
         }
 
         if retries >= 1 {
+            let liveness = api
+                .call(act_ok!(actor => async move { actor.snapshot().await.liveness }))
+                .await
+                .unwrap_or(ConnLiveness::Dead);
             warn!(
-                "Write failed after 1 retries, dropping connection: peer_id: {}",
+                "Write failed after 1 retries, keeping connection in {:?} state for peer_id: {}",
+                liveness,
                 if let Ok(peer_id) = api
                     .call(act_ok!(actor => async move { actor.conn_endpoint_id }))
                     .await
@@ -616,9 +1039,12 @@ async fn write_loop_bounded(
                     "unknown".to_string()
                 }
             );
-            info!("Write task stopped ({})", label);
-            let _ = api.call(act_ok!(actor => actor.close())).await;
-            break;
+            if liveness == ConnLiveness::Dead {
+                info!("Write task stopped ({})", label);
+                let _ = api.call(act_ok!(actor => actor.close())).await;
+                break;
+            }
+            continue;
         }
 
         tx_count.fetch_add(1, Ordering::SeqCst);
@@ -629,29 +1055,69 @@ async fn retry_read_loop(
     conn: Connection,
     sender: tokio::sync::mpsc::Sender<DirectMessage>,
     api: Handle<ConnActor, anyhow::Error>,
+    conn_actor_id: u64,
     rx_count: Arc<AtomicUsize>,
     last_keep_alive: Arc<Mutex<Instant>>,
+    health: Arc<Mutex<ConnHealthWindow>>,
 ) {
     info!("Read task started");
-    let mut retries = 0;
-    while retries < 1 {
-        match tokio::time::timeout(KEEPALIVE_INTERVAL * 5000, read_next_msg(&conn)).await {
-            Ok(Ok(msg)) => {
-                retries = 0;
+    loop {
+        match tokio::time::timeout(KEEPALIVE_INTERVAL * 10, read_next_msg(&conn)).await {
+            Ok(Ok((msg, datagram_len))) => {
+                {
+                    let mut health = health.lock().await;
+                    health.consecutive_read_timeouts = 0;
+                }
                 rx_count.fetch_add(1, Ordering::SeqCst);
                 trace!("Read message from stream, forwarding to network actor");
                 let start = std::time::Instant::now();
-                if msg == DirectMessage::IDontLikeWarnings {
-                    debug!("Received keepalive message, not forwarding to network actor");
-                    let mut last_keep_alive = last_keep_alive.lock().await;
-                    *last_keep_alive = Instant::now();
+                let msg_kind = msg.kind_name();
+                let payload_len = msg.payload_len();
+                debug!(
+                    "iroh-raw-recv peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
+                    conn.remote_id(),
+                    conn_actor_id,
+                    conn.stable_id(),
+                    msg_kind,
+                    payload_len,
+                    datagram_len
+                );
+                let mut last_keep_alive = last_keep_alive.lock().await;
+                *last_keep_alive = Instant::now();
+                if let DirectMessage::IDontLikeWarnings(_) = msg {
+                    debug!(
+                        "Received keepalive message, not forwarding to network actor: peer={} conn_actor_id={} quic_stable_id={} datagram_bytes={}",
+                        conn.remote_id(),
+                        conn_actor_id,
+                        conn.stable_id(),
+                        datagram_len
+                    );
                     continue;
                 }
+
+                debug!(
+                    "iroh-recv peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
+                    conn.remote_id(),
+                    conn_actor_id,
+                    conn.stable_id(),
+                    msg_kind,
+                    payload_len,
+                    datagram_len
+                );
 
                 if let Err(e) = sender.send(msg).await {
                     warn!("Failed to forward message to network actor: {}", e);
                     break;
                 }
+                debug!(
+                    "iroh-forwarded-to-network peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
+                    conn.remote_id(),
+                    conn_actor_id,
+                    conn.stable_id(),
+                    msg_kind,
+                    payload_len,
+                    datagram_len
+                );
                 if start.elapsed().as_millis() > BACKPRESSURE_WARN_MS {
                     warn!(
                         "Direct->Network backpressure: send blocked {} ms",
@@ -659,35 +1125,68 @@ async fn retry_read_loop(
                     );
                 }
             }
-            Ok(Err(ReadError::Multiplex(_))) => {
+            Ok(Err(ReadError::Multiplex(err))) => {
+                warn!("Multiplex error: {:?}", err);
                 continue;
             }
             Ok(Err(e)) => {
                 warn!("Stream read error: {:?}", e);
                 info!("paths info: {:?}", conn.paths());
-                retries += 1;
+                info!("Read task stopped");
+                warn!(
+                    "Read failed after hard error, dropping connection: peer_id: {}",
+                    if let Ok(peer_id) = api
+                        .call(act_ok!(actor => async move { actor.conn_endpoint_id }))
+                        .await
+                    {
+                        peer_id.to_string()
+                    } else {
+                        "unknown".to_string()
+                    }
+                );
+                let _ = api.call(act_ok!(actor => actor.close())).await;
+                break;
             }
             Err(e) => {
                 warn!("Stream read error: timeout after {}", e);
-                retries += 1;
+                {
+                    let mut health = health.lock().await;
+                    health.consecutive_read_timeouts = health.consecutive_read_timeouts.saturating_add(1);
+                }
+
+                let snapshot = api.call(act_ok!(actor => async move { actor.snapshot().await })).await;
+                match snapshot.map(|snapshot| snapshot.liveness) {
+                    Ok(ConnLiveness::Dead) => {
+                        info!("Read task stopped");
+                        warn!(
+                            "Read failed after timeout evidence, dropping connection: peer_id: {}",
+                            if let Ok(peer_id) = api
+                                .call(act_ok!(actor => async move { actor.conn_endpoint_id }))
+                                .await
+                            {
+                                peer_id.to_string()
+                            } else {
+                                "unknown".to_string()
+                            }
+                        );
+                        let _ = api.call(act_ok!(actor => actor.close())).await;
+                        break;
+                    }
+                    Ok(liveness) => {
+                        warn!(
+                            "Read timeout moved connection to {:?}, keeping it for recovery: peer={} conn_actor_id={} quic_stable_id={}",
+                            liveness,
+                            conn.remote_id(),
+                            conn_actor_id,
+                            conn.stable_id()
+                        );
+                    }
+                    Err(err) => {
+                        warn!("Failed to classify timed out connection: {}", err);
+                    }
+                }
             }
         }
-    }
-
-    info!("Read task stopped");
-    if retries >= 1 {
-        warn!(
-            "Read failed after 1 retries, dropping connection: peer_id: {}",
-            if let Ok(peer_id) = api
-                .call(act_ok!(actor => async move { actor.conn_endpoint_id }))
-                .await
-            {
-                peer_id.to_string()
-            } else {
-                "unknown".to_string()
-            }
-        );
-        let _ = api.call(act_ok!(actor => actor.close())).await;
     }
 }
 
@@ -710,19 +1209,58 @@ impl Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-async fn read_next_msg(conn: &Connection) -> Result<DirectMessage, ReadError> {
+async fn read_next_msg(conn: &Connection) -> Result<(DirectMessage, usize), ReadError> {
     let buf = conn
         .read_datagram()
         .await
         .map_err(|e| ReadError::Datagram(format!("failed to read datagram: {}", e)))?;
+    let datagram_len = buf.len();
+    let prefix = buf.first().copied();
+    let preview_len = buf.len().min(8);
+    let preview = buf[..preview_len].to_vec();
+    debug!(
+        "iroh-read-datagram peer={} quic_stable_id={} datagram_bytes={} prefix={:?} preview={:02X?}",
+        conn.remote_id(),
+        conn.stable_id(),
+        datagram_len,
+        prefix,
+        preview
+    );
     if buf.len() > 1 && buf[0] == DATAGRAM_PREFIX {
         let msg: DirectMessage = postcard::from_bytes(&buf[1..])
-            .map_err(|e| ReadError::Deserialize(format!("failed to deserialize message: {}", e)))?;
-        Ok(msg)
+            .map_err(|e| {
+                warn!(
+                    "iroh-read-deserialize-failed peer={} quic_stable_id={} datagram_bytes={} prefix={:?} preview={:02X?} error={}",
+                    conn.remote_id(),
+                    conn.stable_id(),
+                    datagram_len,
+                    prefix,
+                    preview,
+                    e
+                );
+                ReadError::Deserialize(format!("failed to deserialize message: {}", e))
+            })?;
+        debug!(
+            "iroh-read-deserialized peer={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
+            conn.remote_id(),
+            conn.stable_id(),
+            msg.kind_name(),
+            msg.payload_len(),
+            datagram_len
+        );
+        Ok((msg, datagram_len))
     } else {
+        debug!(
+            "iroh-raw-recv-unhandled peer={} datagram_bytes={} prefix={:?} preview={:02X?}",
+            conn.remote_id(),
+            datagram_len,
+            prefix,
+            preview
+        );
         Err(ReadError::Multiplex(format!(
-            "not meant for us: prefix={:X}",
-            buf[0]
+            "not meant for us: len={} prefix={:?}",
+            datagram_len,
+            prefix
         )))
     }
 }

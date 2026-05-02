@@ -8,6 +8,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::{self, Instant};
 
+const DETAIL_LOG_LIMIT: u64 = 5;
+const DETAIL_LOG_EVERY: u64 = 100;
+
 #[derive(Debug, Clone)]
 struct PeerStats {
     tx_count: u64,
@@ -27,6 +30,10 @@ impl PeerStats {
             max_gap: Duration::from_secs(0),
         }
     }
+}
+
+fn should_log_detail(count: u64) -> bool {
+    count <= DETAIL_LOG_LIMIT || count.is_multiple_of(DETAIL_LOG_EVERY)
 }
 
 #[tokio::main]
@@ -97,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = send_tick.tick() => {
                 let payload = format!("mesh:{}:{}", self_ip, start.elapsed().as_millis());
+                let payload_len = payload.len();
                 let socket = Arc::clone(&socket);
                 let stats = Arc::clone(&stats);
                 let peers = peers.clone();
@@ -107,6 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut guard = stats.lock().await;
                             if let Some(s) = guard.get_mut(ip) {
                                 s.tx_count = s.tx_count.saturating_add(1);
+                                if should_log_detail(s.tx_count) {
+                                    println!(
+                                        "MESH_CHECK: TX peer={} tx={} payload_len={} payload={}",
+                                        ip,
+                                        s.tx_count,
+                                        payload_len,
+                                        payload
+                                    );
+                                }
                             }
                         } else {
                             eprintln!("MESH_CHECK: WARN failed to send to {}", addr);
@@ -120,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if len == 0 {
                         continue;
                     }
+                    let payload_text = String::from_utf8_lossy(&recv_buf[..len]).into_owned();
                     if let std::net::IpAddr::V4(src_v4) = src.ip() {
                         let now = Instant::now();
                         let mut guard = stats.lock().await;
@@ -135,6 +153,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             s.last_rx_at = Some(now);
                             s.rx_count = s.rx_count.saturating_add(1);
+                            if should_log_detail(s.rx_count) {
+                                println!(
+                                    "MESH_CHECK: RX peer={} rx={} payload_len={} payload={}",
+                                    src_v4,
+                                    s.rx_count,
+                                    len,
+                                    payload_text
+                                );
+                            }
+                        } else {
+                            println!(
+                                "MESH_CHECK: RX-UNKNOWN peer={} payload_len={} payload={}",
+                                src_v4,
+                                len,
+                                payload_text
+                            );
                         }
                     }
                 }

@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::BufWriter,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -11,13 +13,14 @@ use ipnet::Ipv4Net;
 use iroh::{
     Endpoint, EndpointId, SecretKey,
     endpoint::{
-        IdleTimeout, QuicTransportConfig, VarInt,
+        IdleTimeout, QlogConfig, QlogFactory, QuicTransportConfig, VarInt,
         transports::{AddrKind, TransportBias},
     },
 };
 use iroh_auth::Authenticator;
 
 use iroh_gossip::{net::Gossip, proto::HyparviewConfig};
+use noq::{ConnectionId, Side};
 use sha2::Digest;
 use tracing::{debug, error, info, trace, warn};
 
@@ -28,6 +31,58 @@ use crate::{
 
 const PENDING_TTL: Duration = Duration::from_secs(60);
 const PENDING_MAX_PER_IP: usize = 1024 * 16;
+
+#[derive(Debug)]
+struct LoggingQlogFactory {
+    dir: PathBuf,
+    prefix: String,
+}
+
+impl LoggingQlogFactory {
+    fn new(dir: PathBuf, prefix: impl Into<String>) -> Self {
+        Self {
+            dir,
+            prefix: prefix.into(),
+        }
+    }
+}
+
+impl QlogFactory for LoggingQlogFactory {
+    fn for_connection(
+        &self,
+        side: Side,
+        remote: std::net::SocketAddr,
+        initial_dst_cid: ConnectionId,
+        now: Instant,
+    ) -> Option<QlogConfig> {
+        let timestamp = std::time::SystemTime::now()
+            .checked_sub(Instant::now().duration_since(now))?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        let side_text = format!("{side:?}").to_lowercase();
+        let prefix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}-", self.prefix)
+        };
+        let file_name = format!("{prefix}{timestamp}-{initial_dst_cid}-{side_text}.qlog");
+        let path = self.dir.join(file_name);
+        let file = std::fs::File::create(&path)
+            .inspect_err(|err| warn!("Failed to create qlog file at {}: {}", path.display(), err))
+            .ok()?;
+
+        info!(
+            "iroh-qlog-created remote_addr={} side={} initial_dst_cid={} path={}",
+            remote,
+            side_text,
+            initial_dst_cid,
+            path.display()
+        );
+
+        Some(QlogConfig::new(Box::new(BufWriter::new(file))))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Network {
@@ -69,22 +124,17 @@ struct NetworkActor {
 fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
     const EXPECTED_RTT: u32 = 100;
     //const MAX_STREAM_BANDWIDTH: u32 = 512_000;
-    const STREAM_RWND: u32 = 102_400; //MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
+    //const STREAM_RWND: u32 = 102_400; //MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
 
     let mut transport = QuicTransportConfig::builder()
         //.congestion_controller_factory(Arc::new(BbrConfig::default()))
         .enable_segmentation_offload(false)
-        .packet_threshold(3)
-        .time_threshold(1.125)
-        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(45_000))))
-        .keep_alive_interval(Duration::from_millis(3_000))
-        .stream_receive_window(STREAM_RWND.into())
-        .send_window((4 * STREAM_RWND).into())
+        .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(10_000))))
+        .keep_alive_interval(Duration::from_millis(1_000))
         .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
-        .initial_mtu(1660)
-        .min_mtu(1660)
-        .datagram_receive_buffer_size(Some(65_536))
-        .datagram_send_buffer_size(65_536);
+        .initial_mtu(1200)
+        .mtu_discovery_config(None)
+        .min_mtu(1200);
 
     if let Some(log_path) = log_path {
         if !log_path.exists()
@@ -92,7 +142,10 @@ fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
         {
             error!("Failed to create qlog directory at {:?}: {}", log_path, e);
         }
-        transport = transport.qlog_from_path(log_path, "iroh-lan");
+        transport = transport.qlog_factory(Arc::new(LoggingQlogFactory::new(
+            log_path,
+            "iroh-lan",
+        )));
     }
 
     transport.build()
