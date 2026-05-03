@@ -5,7 +5,7 @@ use n0_watcher::Watchable;
 use noq::VarInt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::{Arc, atomic::AtomicUsize},
 };
 use tokio::sync::Mutex;
@@ -128,6 +128,15 @@ impl Direct {
     pub async fn close(&self) -> Result<()> {
         self.api.call(act!(actor => actor.close())).await
     }
+
+    pub async fn get_connected_peers(&self) -> Result<HashSet<EndpointId>> {
+        self.api
+            .call(act_ok!(actor => async {
+                actor.peers.keys().cloned().collect::<HashSet<EndpointId>>()
+            }
+            ))
+            .await
+    }
 }
 
 impl DirectActor {
@@ -182,38 +191,40 @@ impl DirectActor {
                 let mut tbd = Vec::new();
                 let mut guard = peer.conn_pool.lock().await;
                 for conn in guard.iter_mut() {
-                    if !conn.is_alive().await
-                    {
+                    if !conn.is_alive().await {
                         let snapshot = conn
                             .snapshot()
                             .await
                             .map(|snapshot| snapshot.to_string())
-                            .unwrap_or_else(|| format!("conn_actor_id={} snapshot=unavailable", conn.id()));
+                            .unwrap_or_else(|| {
+                                format!("conn_actor_id={} snapshot=unavailable", conn.id())
+                            });
                         debug!("iroh-pool-drop-dead peer={} snapshot=[{}]", id, snapshot);
                         conn.drop().await;
                         tbd.push(conn.id());
-                        peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        peer.conn_counter
+                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
                 guard.retain(|conn| !tbd.contains(&conn.id()));
 
                 if peer.conn_counter.load(std::sync::atomic::Ordering::SeqCst) < CONN_COUNT_TARGET
-                        && peer.attempts.get() <= MAX_RECONNECT_ATTEMPTS
-                    {
-                        debug!(
-                            "Peer {} has no open connection and {} attempts, will try to reconnect",
-                            id,
-                            peer.attempts.get()
-                        );
-                        drop(guard);
-                        Self::open_new_connection(
-                            id,
-                            peer.clone(),
-                            self.endpoint.clone(),
-                            self.direct_connect_tx.clone(),
-                        )
-                        .await;
-                    }
+                    && peer.attempts.get() <= MAX_RECONNECT_ATTEMPTS
+                {
+                    debug!(
+                        "Peer {} has no open connection and {} attempts, will try to reconnect",
+                        id,
+                        peer.attempts.get()
+                    );
+                    drop(guard);
+                    Self::open_new_connection(
+                        id,
+                        peer.clone(),
+                        self.endpoint.clone(),
+                        self.direct_connect_tx.clone(),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -224,7 +235,8 @@ impl DirectActor {
         endpoint: Endpoint,
         direct_connect_tx: tokio::sync::mpsc::Sender<DirectMessage>,
     ) {
-        peer.conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        peer.conn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Try open new connection
         tokio::spawn(async move {
@@ -237,21 +249,28 @@ impl DirectActor {
                             .snapshot()
                             .await
                             .map(|snapshot| snapshot.to_string())
-                            .unwrap_or_else(|| format!("conn_actor_id={} snapshot=unavailable", new_conn.id()));
+                            .unwrap_or_else(|| {
+                                format!("conn_actor_id={} snapshot=unavailable", new_conn.id())
+                            });
                         let mut guard = peer.conn_pool.lock().await;
                         guard.push(new_conn.clone());
-                        info!("iroh-pool-add-open peer={} snapshot=[{}]", peer_id, snapshot);
+                        info!(
+                            "iroh-pool-add-open peer={} snapshot=[{}]",
+                            peer_id, snapshot
+                        );
                     } else {
                         debug!(
                             "New connection to {} is not alive after establishment, dropping",
                             peer_id
                         );
-                        peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        peer.conn_counter
+                            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         new_conn.drop().await;
                     }
                 }
                 Err(err) => {
-                    peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    peer.conn_counter
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     error!("Failed to establish connection to {}: {}", peer_id, err);
                 }
             }
@@ -259,13 +278,13 @@ impl DirectActor {
     }
 
     async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) -> Result<()> {
-        
         info!("Handling new connection from {}", conn.remote_id());
         let router = self.router.clone();
         let peer = self.peers.entry(conn.remote_id()).or_default().clone();
         let direct_connect_tx = self.direct_connect_tx.clone();
 
-        peer.conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        peer.conn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         info!("New direct connection from {:?}", conn.remote_id());
         let remote_id = conn.remote_id();
@@ -302,17 +321,23 @@ impl DirectActor {
                         .snapshot()
                         .await
                         .map(|snapshot| snapshot.to_string())
-                        .unwrap_or_else(|| format!("conn_actor_id={} snapshot=unavailable", remote_conn.id()));
+                        .unwrap_or_else(|| {
+                            format!("conn_actor_id={} snapshot=unavailable", remote_conn.id())
+                        });
                     let mut guard = peer.conn_pool.lock().await;
                     guard.push(remote_conn.clone());
-                    info!("iroh-pool-add-accept peer={} snapshot=[{}]", remote_id, snapshot);
+                    info!(
+                        "iroh-pool-add-accept peer={} snapshot=[{}]",
+                        remote_id, snapshot
+                    );
                 } else {
                     debug!(
                         "Accepted connection from {} is not alive after establishment, dropping",
                         remote_id
                     );
                     remote_conn.drop().await;
-                    peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    peer.conn_counter
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     return Err(anyhow::anyhow!(
                         "Accepted connection from {} is not alive after establishment",
                         remote_id
@@ -323,7 +348,8 @@ impl DirectActor {
             Err(err) => {
                 error!("Failed to accept connection from {}: {}", remote_id, err);
                 conn.close(VarInt::from_u32(411), b"Failed to accept connection");
-                peer.conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                peer.conn_counter
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 Err(anyhow::anyhow!(
                     "Failed to accept connection from {}: {}",
                     remote_id,
@@ -334,7 +360,7 @@ impl DirectActor {
     }
 
     async fn route_packet(&mut self, to: EndpointId, pkg: DirectMessage) -> Result<()> {
-        trace!("Routing packet to {}", to);
+        //trace!("Routing packet to {}", to);
         match self.peers.entry(to) {
             Entry::Occupied(entry) => {
                 let peer = entry.get();
@@ -353,13 +379,20 @@ impl DirectActor {
                                 ConnLiveness::Suspect => 1,
                                 ConnLiveness::Dead => 2,
                             };
-                            attempt_order.push((priority, snapshot.idle_for_ms, conn.clone(), snapshot));
+                            attempt_order.push((
+                                priority,
+                                snapshot.idle_for_ms,
+                                conn.clone(),
+                                snapshot,
+                            ));
                         }
                     }
                 }
                 drop(guard);
-                attempt_order.sort_by_key(|(priority, idle_for_ms, _, _)| (*priority, *idle_for_ms));
+                attempt_order
+                    .sort_by_key(|(priority, idle_for_ms, _, _)| (*priority, *idle_for_ms));
 
+                /*
                 debug!(
                     "iroh-route-pool peer={} kind={} payload_bytes={} pool_size={} open_candidates={} snapshots=[{}]",
                     to,
@@ -373,27 +406,19 @@ impl DirectActor {
                         pool_snapshots.join(" || ")
                     }
                 );
+                */
 
                 for (_, idle_for_ms, conn, snapshot) in attempt_order {
-                    debug!(
+                   /*debug!(
                         "iroh-route-selected peer={} kind={} payload_bytes={} attempted_liveness={} attempted_idle_for_ms={} snapshot=[{}]",
-                        to,
-                        msg_kind,
-                        payload_len,
-                        snapshot.liveness,
-                        idle_for_ms,
-                        snapshot
-                    );
-                    if conn.write(pkg.clone()).await.is_ok()
-                    {
+                        to, msg_kind, payload_len, snapshot.liveness, idle_for_ms, snapshot
+                    );*/
+                    if conn.write(pkg.clone()).await.is_ok() {
                         return Ok(());
                     }
                     warn!(
                         "iroh-route-write-failed peer={} kind={} payload_bytes={} snapshot=[{}]",
-                        to,
-                        msg_kind,
-                        payload_len,
-                        snapshot
+                        to, msg_kind, payload_len, snapshot
                     );
                 }
                 error!("Failed to write packet to peer {}: no open connections", to);
@@ -434,8 +459,7 @@ impl DirectActor {
 
         let guard = peer.conn_pool.lock().await;
         for conn in guard.iter() {
-            if conn.is_alive().await
-            {
+            if conn.is_alive().await {
                 return Ok(InnerConnState::Open);
             }
         }
@@ -453,7 +477,9 @@ impl DirectActor {
     pub async fn close(&mut self) -> Result<()> {
         for (_, conn_gen) in self.peers.drain() {
             let guard = conn_gen.conn_pool.lock().await;
-            conn_gen.conn_counter.store(0, std::sync::atomic::Ordering::SeqCst);
+            conn_gen
+                .conn_counter
+                .store(0, std::sync::atomic::Ordering::SeqCst);
             for conn in guard.iter() {
                 conn.drop().await;
             }

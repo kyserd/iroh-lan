@@ -830,7 +830,6 @@ impl RouterActor {
                 Ok(false)
             }
             RouterIp::VerifyingIp(ip, start_time) => {
-
                 // if bigger candidate appears no ip
                 if let Ok(candidates) = self.read_ip_candidates(ip, true)
                     && candidates.iter().any(|c| {
@@ -847,9 +846,10 @@ impl RouterActor {
 
                 // if any bigger assignment appears no ip
                 if let Ok(assignments) = self.read_ip_assignments(ip, true)
-                    && assignments
-                        .iter()
-                        .any(|assignment| assignment.endpoint_id != self.endpoint_id && assignment.endpoint_id > self.endpoint_id)
+                    && assignments.iter().any(|assignment| {
+                        assignment.endpoint_id != self.endpoint_id
+                            && assignment.endpoint_id > self.endpoint_id
+                    })
                 {
                     if let Some(assignment) = self.read_ip_assignment(ip, true)? {
                         warn!(

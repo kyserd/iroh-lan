@@ -257,7 +257,7 @@ apply_netem_profile() {
 
             # Build the tc command piecewise so each feature
             # can be independently toggled via empty vars
-            local cmd="tc qdisc add dev eth0 root netem delay 225ms 40ms distribution normal loss gemodel 0.8% 30% 100% 0% reorder 3.5% duplicate 1.5% corrupt 0.05% rate 500kbit"
+            local cmd="tc qdisc add dev eth0 root netem delay 450ms 80ms distribution normal loss gemodel 1.6% 30% 100% 0% reorder 7% duplicate 3% corrupt 0.1% rate 384kbit"
 
             echo "[node${NODE_INDEX}] $cmd"
             eval "$cmd"

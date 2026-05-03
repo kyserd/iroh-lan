@@ -485,7 +485,7 @@ impl ConnActor {
                     if let Some(tx) = &self.write_tx {
                         match tx.try_send(DirectMessage::IDontLikeWarnings(rand::random::<[u8; 128]>().to_vec())) {
                             Ok(_) => {
-                                info!("Sent keepalive, i am {}", if self.is_open_side { "OPEN" } else { "ACCEPT" });
+                                //info!("Sent keepalive, i am {}", if self.is_open_side { "OPEN" } else { "ACCEPT" });
                                 let new_len = self.queue_len.fetch_add(1, Ordering::Relaxed) + 1;
                                 if new_len > QUEUE_WARN_LEN {
                                     warn!("Stream queue length high (keepalive): {}", new_len);
@@ -749,6 +749,7 @@ impl ConnActor {
 
         Ok(())
     }
+
     pub async fn snapshot(&self) -> ConnSnapshot {
         let state = self.conn_state.lock().await.clone();
         let keep_alive = *self.last_keep_alive.lock().await;
@@ -900,7 +901,7 @@ async fn connection_watcher_loop(
             .map(|path| path.to_string())
             .collect::<Vec<_>>()
             .join(" | ");
-        debug!(
+        /*debug!(
             "iroh-path-update peer={} conn_actor_id={} quic_stable_id={} side={} update={:?} paths=[{}]",
             conn.remote_id(),
             conn_actor_id,
@@ -908,7 +909,7 @@ async fn connection_watcher_loop(
             side,
             update,
             path_snapshot
-        );
+        );*/
         if !conn.to_info().is_alive() {
             warn!(
                 "iroh-path-abandoned peer={} conn_actor_id={} quic_stable_id={} side={} paths=[{}]",
@@ -969,7 +970,7 @@ async fn write_loop_bounded(
 
         let mut retries = 0;
         while retries < 1 {
-            debug!(
+            /*debug!(
                 "iroh-send peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
                 conn.remote_id(),
                 conn_actor_id,
@@ -977,7 +978,7 @@ async fn write_loop_bounded(
                 msg_kind,
                 payload_len,
                 datagram_len
-            );
+            );*/
             match time::timeout(
                 KEEPALIVE_INTERVAL * 5,
                 async { conn.send_datagram(Bytes::from(buf.clone())) },
@@ -989,7 +990,7 @@ async fn write_loop_bounded(
                         let mut health = health.lock().await;
                         health.consecutive_write_timeouts = 0;
                     }
-                    debug!(
+                    /*debug!(
                         "iroh-send-ok peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
                         conn.remote_id(),
                         conn_actor_id,
@@ -997,7 +998,7 @@ async fn write_loop_bounded(
                         msg_kind,
                         payload_len,
                         datagram_len
-                    );
+                    );*/
                     break;
                 }
                 Ok(Err(err)) => {
@@ -1069,11 +1070,11 @@ async fn retry_read_loop(
                     health.consecutive_read_timeouts = 0;
                 }
                 rx_count.fetch_add(1, Ordering::SeqCst);
-                trace!("Read message from stream, forwarding to network actor");
+                //trace!("Read message from stream, forwarding to network actor");
                 let start = std::time::Instant::now();
                 let msg_kind = msg.kind_name();
                 let payload_len = msg.payload_len();
-                debug!(
+                /*debug!(
                     "iroh-raw-recv peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
                     conn.remote_id(),
                     conn_actor_id,
@@ -1081,21 +1082,21 @@ async fn retry_read_loop(
                     msg_kind,
                     payload_len,
                     datagram_len
-                );
+                );*/
                 let mut last_keep_alive = last_keep_alive.lock().await;
                 *last_keep_alive = Instant::now();
                 if let DirectMessage::IDontLikeWarnings(_) = msg {
-                    debug!(
+                    /*debug!(
                         "Received keepalive message, not forwarding to network actor: peer={} conn_actor_id={} quic_stable_id={} datagram_bytes={}",
                         conn.remote_id(),
                         conn_actor_id,
                         conn.stable_id(),
                         datagram_len
-                    );
+                    );*/
                     continue;
                 }
 
-                debug!(
+                /*debug!(
                     "iroh-recv peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
                     conn.remote_id(),
                     conn_actor_id,
@@ -1103,13 +1104,13 @@ async fn retry_read_loop(
                     msg_kind,
                     payload_len,
                     datagram_len
-                );
+                );*/
 
                 if let Err(e) = sender.send(msg).await {
                     warn!("Failed to forward message to network actor: {}", e);
                     break;
                 }
-                debug!(
+                /*debug!(
                     "iroh-forwarded-to-network peer={} conn_actor_id={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
                     conn.remote_id(),
                     conn_actor_id,
@@ -1117,7 +1118,7 @@ async fn retry_read_loop(
                     msg_kind,
                     payload_len,
                     datagram_len
-                );
+                );*/
                 if start.elapsed().as_millis() > BACKPRESSURE_WARN_MS {
                     warn!(
                         "Direct->Network backpressure: send blocked {} ms",
@@ -1218,14 +1219,14 @@ async fn read_next_msg(conn: &Connection) -> Result<(DirectMessage, usize), Read
     let prefix = buf.first().copied();
     let preview_len = buf.len().min(8);
     let preview = buf[..preview_len].to_vec();
-    debug!(
+    /*debug!(
         "iroh-read-datagram peer={} quic_stable_id={} datagram_bytes={} prefix={:?} preview={:02X?}",
         conn.remote_id(),
         conn.stable_id(),
         datagram_len,
         prefix,
         preview
-    );
+    );*/
     if buf.len() > 1 && buf[0] == DATAGRAM_PREFIX {
         let msg: DirectMessage = postcard::from_bytes(&buf[1..])
             .map_err(|e| {
@@ -1240,14 +1241,14 @@ async fn read_next_msg(conn: &Connection) -> Result<(DirectMessage, usize), Read
                 );
                 ReadError::Deserialize(format!("failed to deserialize message: {}", e))
             })?;
-        debug!(
+        /*debug!(
             "iroh-read-deserialized peer={} quic_stable_id={} kind={} payload_bytes={} datagram_bytes={}",
             conn.remote_id(),
             conn.stable_id(),
             msg.kind_name(),
             msg.payload_len(),
             datagram_len
-        );
+        );*/
         Ok((msg, datagram_len))
     } else {
         debug!(

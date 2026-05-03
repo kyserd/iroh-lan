@@ -16,9 +16,14 @@ use tracing::{debug, info, trace, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
     /// A single key was inserted locally, propagate immediately.
-    Insert { key: String, timestamp: u64 },
+    Insert {
+        author: EndpointId,
+        key: String,
+        timestamp: u64,
+    },
     /// Full state dump.  `nonce` ensures gossip never deduplicates the message.
     State {
+        author: EndpointId,
         entries: Vec<(String, u64)>,
         nonce: u64,
     },
@@ -26,6 +31,7 @@ enum Message {
 
 #[derive(Debug, Clone)]
 pub struct KvEvent {
+    pub author: EndpointId,
     pub key: String,
     pub timestamp: u64,
     /// `true` when the key came from a remote peer.
@@ -115,12 +121,14 @@ impl Kv {
 
         // Best-effort broadcast, don't block the caller on gossip errors.
         self.send(Message::Insert {
+            author: self.inner.endpoint_id,
             key: key.clone(),
             timestamp: ts,
         })
         .await;
 
         let _ = self.inner.updates.send(KvEvent {
+            author: self.inner.endpoint_id,
             key,
             timestamp: ts,
             remote: false,
@@ -180,6 +188,16 @@ impl Kv {
     pub fn subscribe(&self) -> broadcast::Receiver<KvEvent> {
         self.inner.updates.subscribe()
     }
+
+    /// Check if we have assigned or candidate entries about a specific peer
+    pub async fn has_entries_about_peer(&self, author: EndpointId) -> bool {
+        self.inner
+            .store
+            .lock()
+            .await
+            .iter()
+            .any(|(k, _)| k.contains(&author.to_string()))
+    }
 }
 
 impl Kv {
@@ -215,6 +233,7 @@ impl Kv {
         }
         debug!("[Kv] Broadcasting state ({} keys)", entries.len());
         self.send(Message::State {
+            author: self.inner.endpoint_id,
             entries,
             nonce: now_millis(),
         })
@@ -243,8 +262,6 @@ impl Kv {
 const JITTER_MIN_MS: u64 = 200;
 const JITTER_MAX_MS: u64 = 2_000;
 const PERIODIC_SYNC_SECS: u64 = 30;
-const INITIAL_PERIODIC_SYNC_SECS: u64 = 2;
-const INITIAL_PERIOD_LENGTH_SECS: u64 = 30;
 const DIAGNOSTIC_LOG_SECS: u64 = 10;
 const PEER_DISCONNECT_BACKOFF_INIT_SECS: u64 = 2;
 const PEER_DISCONNECT_BACKOFF_INC_SECS: u64 = 2;
@@ -267,9 +284,6 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     let mut periodic = tokio::time::interval(Duration::from_secs(PERIODIC_SYNC_SECS));
     periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut initial_tick = tokio::time::interval(Duration::from_secs(INITIAL_PERIODIC_SYNC_SECS));
-    initial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     let mut diagnostics = tokio::time::interval(Duration::from_secs(DIAGNOSTIC_LOG_SECS));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -282,7 +296,6 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
     // On startup, schedule an initial state broadcast so any existing peers
     // learn about keys we may have inserted before the worker started.
     schedule_state(&mut state_timer, &mut state_pending);
-    let started = Instant::now();
     loop {
         tokio::select! {
             event = receiver.next() => {
@@ -331,12 +344,6 @@ async fn worker(kv: Kv, mut receiver: GossipReceiver) {
             }
             _ = periodic.tick() => {
                 schedule_state(&mut state_timer, &mut state_pending);
-            }
-            _ = initial_tick.tick() => {
-                if started.elapsed() < Duration::from_secs(INITIAL_PERIOD_LENGTH_SECS) {
-                    debug!("[Kv] initial sync tick, scheduling state broadcast");
-                    schedule_now(&mut state_timer, &mut state_pending);
-                }
             }
             _ = diagnostics.tick() => {
                 let neighbors = receiver.neighbors().count();
@@ -403,12 +410,6 @@ fn schedule_state(timer: &mut Pin<Box<tokio::time::Sleep>>, pending: &mut bool) 
     trace!("[Kv] State broadcast scheduled in {}ms", jitter);
 }
 
-fn schedule_now(timer: &mut Pin<Box<tokio::time::Sleep>>, pending: &mut bool) {
-    timer.as_mut().reset(tokio::time::Instant::now());
-    *pending = true;
-    trace!("[Kv] State broadcast scheduled immediately");
-}
-
 /// Parse and apply one incoming gossip message.
 ///
 /// When a `State` message is received from another peer we only cancel our
@@ -430,24 +431,37 @@ async fn handle_received(kv: &Kv, raw: &[u8], state_pending: &mut bool) -> bool 
     };
 
     match msg {
-        Message::Insert { key, timestamp } => {
+        Message::Insert {
+            author,
+            key,
+            timestamp,
+        } => {
             if kv.apply(&key, timestamp).await {
-                debug!("[Kv] remote insert: {}", key);
+                debug!("[Kv] remote insert from {}: {}", author, key);
                 let _ = kv.inner.updates.send(KvEvent {
+                    author,
                     key,
                     timestamp,
                     remote: true,
                 });
             }
         }
-        Message::State { entries, .. } => {
+        Message::State {
+            author, entries, ..
+        } => {
             let remote_map: std::collections::HashMap<&str, u64> =
                 entries.iter().map(|(k, ts)| (k.as_str(), *ts)).collect();
+            debug!(
+                "[Kv] received state from {}: {} keys",
+                author,
+                entries.len()
+            );
 
             let mut applied = 0usize;
             for (key, timestamp) in &entries {
                 if kv.apply(key, *timestamp).await {
                     let _ = kv.inner.updates.send(KvEvent {
+                        author,
                         key: key.clone(),
                         timestamp: *timestamp,
                         remote: true,

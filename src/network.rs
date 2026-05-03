@@ -122,18 +122,12 @@ struct NetworkActor {
 }*/
 
 fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
-    const EXPECTED_RTT: u32 = 100;
-    //const MAX_STREAM_BANDWIDTH: u32 = 512_000;
-    //const STREAM_RWND: u32 = 102_400; //MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT * 2;
-
     let mut transport = QuicTransportConfig::builder()
-        //.congestion_controller_factory(Arc::new(BbrConfig::default()))
         .enable_segmentation_offload(false)
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(10_000))))
         .keep_alive_interval(Duration::from_millis(1_000))
-        .initial_rtt(Duration::from_millis(EXPECTED_RTT as u64))
         .initial_mtu(1200)
-        .mtu_discovery_config(None)
+        //.mtu_discovery_config(None)
         .min_mtu(1200);
 
     if let Some(log_path) = log_path {
@@ -142,10 +136,7 @@ fn transport_config(log_path: Option<PathBuf>) -> QuicTransportConfig {
         {
             error!("Failed to create qlog directory at {:?}: {}", log_path, e);
         }
-        transport = transport.qlog_factory(Arc::new(LoggingQlogFactory::new(
-            log_path,
-            "iroh-lan",
-        )));
+        transport = transport.qlog_factory(Arc::new(LoggingQlogFactory::new(log_path, "iroh-lan")));
     }
 
     transport.build()
@@ -221,11 +212,11 @@ impl Network {
                 .hooks(auth.clone())
                 .secret_key(secret_key.clone())
                 .transport_config(transport_config(log_dir))
-                .transport_bias(
+                /*.transport_bias(
                     AddrKind::Relay,
                     TransportBias::primary() // PathStatus::Available -> keep-alive pings
                         .with_rtt_disadvantage(Duration::from_millis(500)), // direct still wins selection
-                ),
+                ),*/
         )
         .await?;
 

@@ -142,23 +142,23 @@ impl TunActor {
                                             if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
                                                 let src_port = tcp.get_source();
                                                 let dst_port = tcp.get_destination();
-                                                debug!("dst={} dst-port={} src={} protocol={}: ip internal src-port={}", ipv4.get_destination(), dst_port, ipv4.get_source(), ipv4.get_next_level_protocol(), src_port);
+                                                //debug!("dst={} dst-port={} src={} protocol={}: ip internal src-port={}", ipv4.get_destination(), dst_port, ipv4.get_source(), ipv4.get_next_level_protocol(), src_port);
                                             }
                                         }
                                         IpNextHeaderProtocols::Udp => {
                                             if let Some(udp) = UdpPacket::new(ipv4.payload()) {
                                                 let src_port = udp.get_source();
                                                 let dst_port = udp.get_destination();
-                                                debug!("dst={} dst-port={} src={} protocol={}: ip internal src-port={}", ipv4.get_destination(), dst_port, ipv4.get_source(), ipv4.get_next_level_protocol(), src_port);
+                                                //debug!("dst={} dst-port={} src={} protocol={}: ip internal src-port={}", ipv4.get_destination(), dst_port, ipv4.get_source(), ipv4.get_next_level_protocol(), src_port);
                                             }
                                         }
                                         IpNextHeaderProtocols::Icmp => {
                                             if let Some(icmp) = IcmpPacket::new(ipv4.payload()) {
-                                                debug!("dst={} dst-port=N/A src={} protocol={}: ip internal src-port=N/A (icmp type={:?} code={:?})", ipv4.get_destination(), ipv4.get_source(), ipv4.get_next_level_protocol(), icmp.get_icmp_type(), icmp.get_icmp_code());
+                                                //debug!("dst={} dst-port=N/A src={} protocol={}: ip internal src-port=N/A (icmp type={:?} code={:?})", ipv4.get_destination(), ipv4.get_source(), ipv4.get_next_level_protocol(), icmp.get_icmp_type(), icmp.get_icmp_code());
                                             }
                                         }
                                         _ => {
-                                            debug!("dst={} dst-port=N/A src={} protocol={}: ip internal src-port=N/A", ipv4.get_destination(), ipv4.get_source(), ipv4.get_next_level_protocol());
+                                            //debug!("dst={} dst-port=N/A src={} protocol={}: ip internal src-port=N/A", ipv4.get_destination(), ipv4.get_source(), ipv4.get_next_level_protocol());
                                         }
                                     }
                                 }
