@@ -165,9 +165,13 @@ async fn bind_endpoint(endpoint_builder: iroh::endpoint::Builder) -> Result<Endp
     let ifaces = if_addrs::get_if_addrs()?;
     let mut builder = endpoint_builder.clear_ip_transports();
     let mut bound_any = false;
+    let mut seen_interfaces: Vec<(IpAddr, String)> = Vec::new();
     for iface in ifaces {
         let ip = iface.addr.ip();
-
+        if seen_interfaces.iter().any(|(ip_type, iface_name)| ip_type.is_ipv4() == ip.is_ipv4() && iface_name.eq(&iface.name)) {
+            continue;
+        }
+        seen_interfaces.push((ip, iface.name.clone()));
         if iface.is_loopback() || is_vpn_addr(ip) {
             continue;
         }
