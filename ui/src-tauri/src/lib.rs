@@ -8,9 +8,7 @@ use tracing::info;
 // Re-export lib so main.rs can call run()
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
-static NETWORK: Lazy<Mutex<Option<Network>>> = Lazy::new(|| {
-    Mutex::new(None)
-});
+static NETWORK: Lazy<Mutex<Option<Network>>> = Lazy::new(|| Mutex::new(None));
 
 #[derive(Debug, Serialize)]
 pub enum Status {
@@ -157,7 +155,7 @@ async fn list_peers() -> Result<Vec<PeerInfo>, String> {
                 .get_peer_state(peer.0)
                 .await
                 .map_err(|e| e.to_string())
-                .unwrap_or(iroh_lan::ConnState::Disconnected);
+                .unwrap_or(iroh_lan::InnerConnState::Closed);
             peer_infos.push(PeerInfo {
                 node_id: peer.0.to_string(),
                 ip: match peer.1 {
@@ -165,11 +163,9 @@ async fn list_peers() -> Result<Vec<PeerInfo>, String> {
                     None => "unknown".to_string(),
                 },
                 status: match status {
-                    iroh_lan::ConnState::Connecting => Status::Disconnected,
-                    iroh_lan::ConnState::Open => Status::Active,
-                    iroh_lan::ConnState::Disconnected => Status::Disconnected,
-                    iroh_lan::ConnState::Closed => Status::Disconnected,
-                    iroh_lan::ConnState::ClosedAndStopped => Status::Disconnected,
+                    iroh_lan::InnerConnState::Connecting => Status::Disconnected,
+                    iroh_lan::InnerConnState::Open => Status::Active,
+                    iroh_lan::InnerConnState::Closed => Status::Disconnected,
                 },
             });
         }
