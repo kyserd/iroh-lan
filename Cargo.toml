@@ -38,8 +38,8 @@ n0-watcher = "0.6.1"
 if-addrs = "0.15"
 ipnet = "2"
 
-iroh-auth = { path="../iroh-auth" }#{ git="https://github.com/rustonbsd/iroh-auth", rev="572b662c675c821945538e66e020801408960b48" }
-actor-helper = { version="0.3.0", features=["anyhow", "tokio"]} #{ git = "https://github.com/rustonbsd/actor-helper", rev="9af542cc2d26354dcc4d87d270408326aa319397", features=["anyhow", "tokio"] }
+iroh-auth = { git="https://github.com/rustonbsd/iroh-auth", rev="8143b334819fe56863249e5b14e912f1964865e7" }
+actor-helper = { version="0.3.0", features=["anyhow", "tokio"]}
 clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
