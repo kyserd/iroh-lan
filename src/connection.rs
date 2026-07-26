@@ -1,4 +1,5 @@
 use std::fmt::{self, Display};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
@@ -10,7 +11,8 @@ use bytes::Bytes;
 use futures_lite::StreamExt;
 use iroh::address_lookup::{AddressLookup, DnsAddressLookup};
 use iroh::endpoint::{Connection, VarInt};
-use iroh::{Endpoint, EndpointAddr, EndpointId, Watcher};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
+use n0_watcher::Watchable;
 use tokio::sync::Mutex;
 use tokio::time::{self, Instant};
 use tracing::{debug, info, trace, warn};
@@ -21,8 +23,8 @@ const MAX_SENDER_QUEUE: usize = 50_000;
 const WRITE_CHANNEL_CAP: usize = 8_192;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_WARN_LEN: usize = 10_000;
-const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
-const CONNECTING_TIMEOUT: Duration = Duration::from_secs(20);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(2000);
+const CONNECTING_TIMEOUT: Duration = Duration::from_secs(15);
 const DATAGRAM_PREFIX: u8 = 0x43;
 const MAX_CONSECUTIVE_READ_TIMEOUTS: usize = 3;
 const MAX_CONSECUTIVE_WRITE_TIMEOUTS: usize = 3;
@@ -191,8 +193,7 @@ fn side_label(is_open_side: bool) -> &'static str {
 }
 
 fn snapshot_paths(conn: &Connection) -> Vec<ConnPathSnapshot> {
-    conn.to_info()
-        .paths()
+    conn.paths()
         .into_iter()
         .map(|path| {
             let stats = path.stats();
@@ -200,13 +201,13 @@ fn snapshot_paths(conn: &Connection) -> Vec<ConnPathSnapshot> {
                 path_id: format!("{:?}", path.id()),
                 remote_addr: format!("{:?}", path.remote_addr()),
                 is_selected: path.is_selected(),
-                is_closed: path.is_closed(),
-                rtt_ms: path.rtt().map(|value| value.as_millis()),
-                lost_packets: stats.as_ref().map(|value| value.lost_packets),
-                black_holes_detected: stats.as_ref().map(|value| value.black_holes_detected),
-                current_mtu: stats.as_ref().map(|value| value.current_mtu),
-                udp_tx_datagrams: stats.as_ref().map(|value| value.udp_tx.datagrams),
-                udp_rx_datagrams: stats.as_ref().map(|value| value.udp_rx.datagrams),
+                is_closed: false,
+                rtt_ms: Some(path.rtt().as_millis()),
+                lost_packets: Some(stats.lost_packets),
+                black_holes_detected: Some(stats.black_holes_detected),
+                current_mtu: Some(stats.current_mtu),
+                udp_tx_datagrams: Some(stats.udp_tx.datagrams),
+                udp_rx_datagrams: Some(stats.udp_rx.datagrams),
             }
         })
         .collect()
@@ -238,6 +239,7 @@ struct ConnActor {
     conn_endpoint_id: EndpointId,
     id: u64,
 
+
     external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
 
     write_task: Option<tokio::task::JoinHandle<()>>,
@@ -260,6 +262,11 @@ struct ConnActor {
     conn_state: Arc<Mutex<InnerConnState>>,
     last_keep_alive: Arc<Mutex<Instant>>,
     health: Arc<Mutex<ConnHealthWindow>>,
+
+    dest_ip: Option<Ipv4Addr>,
+
+    latest_frame: Watchable<Vec<u8>>,
+    remote_frame_tx: tokio::sync::mpsc::Sender<(EndpointId, Vec<u8>)>,
 }
 
 impl Conn {
@@ -284,6 +291,8 @@ impl Conn {
     pub async fn accept_connection(
         conn: iroh::endpoint::Connection,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
+        latest_frame: Watchable<Vec<u8>>,
+        remote_frame_tx: tokio::sync::mpsc::Sender<(EndpointId, Vec<u8>)>
     ) -> Result<Self> {
         let conn_state = Arc::new(Mutex::new(InnerConnState::Connecting));
         let last_keep_alive = Arc::new(Mutex::new(Instant::now()));
@@ -296,13 +305,12 @@ impl Conn {
                 false,
                 conn_state.clone(),
                 last_keep_alive.clone(),
+                latest_frame,
+                remote_frame_tx
             ),
             |mut actor, rx| async move { actor.run(rx).await },
         );
-        let s = Self {
-            id,
-            api,
-        };
+        let s = Self { id, api };
         let self_handle = s.api.clone();
         s.api
             .call(act_ok!(actor => async move {
@@ -327,6 +335,8 @@ impl Conn {
         endpoint: Endpoint,
         remote_endpoint_id: EndpointId,
         external_sender: tokio::sync::mpsc::Sender<DirectMessage>,
+        latest_frame: Watchable<Vec<u8>>,
+        remote_frame_tx: tokio::sync::mpsc::Sender<(EndpointId, Vec<u8>)>,
     ) -> Result<Self> {
         let conn_state = Arc::new(Mutex::new(InnerConnState::Connecting));
         let last_keep_alive = Arc::new(Mutex::new(Instant::now()));
@@ -339,13 +349,12 @@ impl Conn {
                 true,
                 conn_state.clone(),
                 last_keep_alive.clone(),
+                latest_frame,
+                remote_frame_tx,
             ),
             |mut actor, rx| async move { actor.run(rx).await },
         );
-        let s = Self {
-            id,
-            api,
-        };
+        let s = Self { id, api };
         let self_handle = s.api.clone();
         s.api
             .call(act_ok!(actor => async move {
@@ -483,7 +492,11 @@ impl ConnActor {
                         continue;
                     }
                     if let Some(tx) = &self.write_tx {
-                        match tx.try_send(DirectMessage::IDontLikeWarnings(rand::random::<[u8; 128]>().to_vec())) {
+                        let latest_frame = self.latest_frame.get();
+                        if latest_frame.is_empty() {
+                            println!("Sending empty KeepAlive");
+                        }
+                        match tx.try_send(DirectMessage::IDontLikeWarnings(latest_frame.clone())) {
                             Ok(_) => {
                                 //info!("Sent keepalive, i am {}", if self.is_open_side { "OPEN" } else { "ACCEPT" });
                                 let new_len = self.queue_len.fetch_add(1, Ordering::Relaxed) + 1;
@@ -506,10 +519,11 @@ impl ConnActor {
                         warn!("[PROBE-QUEUE] High Queue Len: {}", q_len);
                     }
                     debug!(
-                        "{}-{} Conn stats: endpoint_id={} state={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
+                        "{}-{} Conn stats: endpoint_id={} ip={:?} state={:?} rx_count={} tx_count={} queue_len={} write_timeouts={} write_errors={} dropped_packets={}",
                         if self.is_open_side { "[OPEN]" } else { "[ACCEPT]" },
                         self.id,
                         self.conn_endpoint_id,
+                        self.dest_ip,
                         current_state,
                         self.rx_count.load(Ordering::Relaxed),
                         self.tx_count.load(Ordering::Relaxed),
@@ -538,7 +552,12 @@ impl ConnActor {
         is_open_side: bool,
         conn_state: Arc<Mutex<InnerConnState>>,
         last_keep_alive: Arc<Mutex<Instant>>,
+        latest_frame: Watchable<Vec<u8>>,
+        remote_frame_tx: tokio::sync::mpsc::Sender<(EndpointId, Vec<u8>)>,
     ) -> Self {
+        if latest_frame.get().is_empty() {
+            println!("New: Setting empty frame");
+        }
         Self {
             id,
             external_sender,
@@ -560,6 +579,9 @@ impl ConnActor {
             conn_state,
             last_keep_alive,
             health: Arc::new(Mutex::new(ConnHealthWindow::default())),
+            dest_ip: None,
+            latest_frame,
+            remote_frame_tx,
         }
     }
 
@@ -594,6 +616,13 @@ impl ConnActor {
     }
 
     pub async fn write(&mut self, pkg: DirectMessage) {
+        if self.dest_ip.is_none()
+            && let DirectMessage::IpPacket(pkg) = &pkg
+            && let Ok(ip) = pkg.to_ipv4_packet()
+        {
+            self.dest_ip = Some(ip.get_destination());
+        }
+
         if let Some(tx) = &self.write_tx {
             trace!("Sending packet to write task");
             match tx.try_send(pkg) {
@@ -662,6 +691,7 @@ impl ConnActor {
             rx_count,
             self.last_keep_alive.clone(),
             self.health.clone(),
+            self.remote_frame_tx.clone(),
         )));
 
         info!("Spawning write task for incoming connection");
@@ -693,10 +723,7 @@ impl ConnActor {
         self.conn = Some(conn);
         if self.conn.is_some() {
             let snapshot = self.snapshot().await;
-            info!(
-                "iroh-conn-established {}",
-                snapshot
-            );
+            info!("iroh-conn-established {}", snapshot);
             debug!(
                 "iroh-qlog-filename-hint peer={} conn_actor_id={} quic_stable_id={} side={} qlog_filename_format=<prefix><unix_ms>-<initial_dst_cid>-<{}>.qlog",
                 self.conn_endpoint_id,
@@ -754,22 +781,28 @@ impl ConnActor {
         let state = self.conn_state.lock().await.clone();
         let keep_alive = *self.last_keep_alive.lock().await;
         let idle_for_ms = Instant::now().duration_since(keep_alive).as_millis();
-        let (quic_stable_id, selected_path, paths, total_lost_packets, total_udp_tx_datagrams, total_udp_rx_datagrams) =
-            if let Some(conn) = self.conn.as_ref() {
-                let paths = snapshot_paths(conn);
-                let selected_path = paths.iter().find(|path| path.is_selected).cloned();
-                let stats = conn.to_info().stats();
-                (
-                    Some(conn.stable_id()),
-                    selected_path,
-                    paths,
-                    stats.as_ref().map(|value| value.lost_packets),
-                    stats.as_ref().map(|value| value.udp_tx.datagrams),
-                    stats.as_ref().map(|value| value.udp_rx.datagrams),
-                )
-            } else {
-                (None, None, Vec::new(), None, None, None)
-            };
+        let (
+            quic_stable_id,
+            selected_path,
+            paths,
+            total_lost_packets,
+            total_udp_tx_datagrams,
+            total_udp_rx_datagrams,
+        ) = if let Some(conn) = self.conn.as_ref() {
+            let paths = snapshot_paths(conn);
+            let selected_path = paths.iter().find(|path| path.is_selected).cloned();
+            let stats = conn.stats();
+            (
+                Some(conn.stable_id()),
+                selected_path,
+                paths,
+                Some(stats.lost_packets),
+                Some(stats.udp_tx.datagrams),
+                Some(stats.udp_rx.datagrams),
+            )
+        } else {
+            (None, None, Vec::new(), None, None, None)
+        };
 
         let rx_count = self.rx_count.load(Ordering::Relaxed);
         let tx_count = self.tx_count.load(Ordering::Relaxed);
@@ -871,7 +904,10 @@ fn classify_liveness(
         return ConnLiveness::Suspect;
     }
 
-    if !has_selected_open_path && has_open_path && health.consecutive_read_timeouts < MAX_CONSECUTIVE_READ_TIMEOUTS {
+    if !has_selected_open_path
+        && has_open_path
+        && health.consecutive_read_timeouts < MAX_CONSECUTIVE_READ_TIMEOUTS
+    {
         return ConnLiveness::Suspect;
     }
 
@@ -894,14 +930,14 @@ async fn connection_watcher_loop(
     side: &'static str,
     health: Arc<Mutex<ConnHealthWindow>>,
 ) {
-    let mut watcher = conn.paths().stream();
+    let mut watcher = conn.paths_stream();
     while let Some(update) = watcher.next().await {
         let path_snapshot = snapshot_paths(&conn)
             .into_iter()
             .map(|path| path.to_string())
             .collect::<Vec<_>>()
             .join(" | ");
-        /*debug!(
+        debug!(
             "iroh-path-update peer={} conn_actor_id={} quic_stable_id={} side={} update={:?} paths=[{}]",
             conn.remote_id(),
             conn_actor_id,
@@ -909,8 +945,8 @@ async fn connection_watcher_loop(
             side,
             update,
             path_snapshot
-        );*/
-        if !conn.to_info().is_alive() {
+        );
+        if conn.weak_handle().upgrade().is_none() {
             warn!(
                 "iroh-path-abandoned peer={} conn_actor_id={} quic_stable_id={} side={} paths=[{}]",
                 conn.remote_id(),
@@ -979,10 +1015,9 @@ async fn write_loop_bounded(
                 payload_len,
                 datagram_len
             );*/
-            match time::timeout(
-                KEEPALIVE_INTERVAL * 5,
-                async { conn.send_datagram(Bytes::from(buf.clone())) },
-            )
+            match time::timeout(KEEPALIVE_INTERVAL * 3, async {
+                conn.send_datagram(Bytes::from(buf.clone()))
+            })
             .await
             {
                 Ok(Ok(())) => {
@@ -1005,7 +1040,8 @@ async fn write_loop_bounded(
                     warn!("Write error (frame): {}, {:?}, retrying...", err, err);
                     {
                         let mut health = health.lock().await;
-                        health.consecutive_write_timeouts = health.consecutive_write_timeouts.saturating_add(1);
+                        health.consecutive_write_timeouts =
+                            health.consecutive_write_timeouts.saturating_add(1);
                     }
                     retries += 1;
                     time::sleep(Duration::from_millis(100)).await;
@@ -1015,7 +1051,8 @@ async fn write_loop_bounded(
                     write_timeout.fetch_add(1, Ordering::SeqCst);
                     {
                         let mut health = health.lock().await;
-                        health.consecutive_write_timeouts = health.consecutive_write_timeouts.saturating_add(1);
+                        health.consecutive_write_timeouts =
+                            health.consecutive_write_timeouts.saturating_add(1);
                     }
                     time::sleep(Duration::from_millis(100)).await;
                     break;
@@ -1060,10 +1097,11 @@ async fn retry_read_loop(
     rx_count: Arc<AtomicUsize>,
     last_keep_alive: Arc<Mutex<Instant>>,
     health: Arc<Mutex<ConnHealthWindow>>,
+    remote_frame_tx: tokio::sync::mpsc::Sender<(EndpointId, Vec<u8>)>,
 ) {
     info!("Read task started");
     loop {
-        match tokio::time::timeout(KEEPALIVE_INTERVAL * 10, read_next_msg(&conn)).await {
+        match tokio::time::timeout(KEEPALIVE_INTERVAL * 3, read_next_msg(&conn)).await {
             Ok(Ok((msg, datagram_len))) => {
                 {
                     let mut health = health.lock().await;
@@ -1085,7 +1123,7 @@ async fn retry_read_loop(
                 );*/
                 let mut last_keep_alive = last_keep_alive.lock().await;
                 *last_keep_alive = Instant::now();
-                if let DirectMessage::IDontLikeWarnings(_) = msg {
+                if let DirectMessage::IDontLikeWarnings(frame) = msg {
                     /*debug!(
                         "Received keepalive message, not forwarding to network actor: peer={} conn_actor_id={} quic_stable_id={} datagram_bytes={}",
                         conn.remote_id(),
@@ -1093,6 +1131,12 @@ async fn retry_read_loop(
                         conn.stable_id(),
                         datagram_len
                     );*/
+                    if frame.is_empty() {
+                        let remote_id = conn.remote_id();
+                        debug!(%remote_id, "received empty keepalive frame");
+                        continue;
+                    }
+                    remote_frame_tx.send((conn.remote_id(), frame)).await.ok();
                     continue;
                 }
 
@@ -1152,10 +1196,13 @@ async fn retry_read_loop(
                 warn!("Stream read error: timeout after {}", e);
                 {
                     let mut health = health.lock().await;
-                    health.consecutive_read_timeouts = health.consecutive_read_timeouts.saturating_add(1);
+                    health.consecutive_read_timeouts =
+                        health.consecutive_read_timeouts.saturating_add(1);
                 }
 
-                let snapshot = api.call(act_ok!(actor => async move { actor.snapshot().await })).await;
+                let snapshot = api
+                    .call(act_ok!(actor => async move { actor.snapshot().await }))
+                    .await;
                 match snapshot.map(|snapshot| snapshot.liveness) {
                     Ok(ConnLiveness::Dead) => {
                         info!("Read task stopped");
@@ -1181,6 +1228,12 @@ async fn retry_read_loop(
                             conn_actor_id,
                             conn.stable_id()
                         );
+
+                        warn!(
+                            "Stopping read task just because it doesnt open a new conn if it is kept"
+                        );
+                        let _ = api.call(act_ok!(actor => actor.close())).await;
+                        break;
                     }
                     Err(err) => {
                         warn!("Failed to classify timed out connection: {}", err);
@@ -1260,12 +1313,10 @@ async fn read_next_msg(conn: &Connection) -> Result<(DirectMessage, usize), Read
         );
         Err(ReadError::Multiplex(format!(
             "not meant for us: len={} prefix={:?}",
-            datagram_len,
-            prefix
+            datagram_len, prefix
         )))
     }
 }
-
 
 async fn resolve_addr(ep: &Endpoint, peer_id: EndpointId) -> EndpointAddr {
     let dns = DnsAddressLookup::n0_dns()
@@ -1277,17 +1328,14 @@ async fn resolve_addr(ep: &Endpoint, peer_id: EndpointId) -> EndpointAddr {
         Some(stream) => {
             // Take the first successful result
             stream
-                .filter_map(|item|  item.ok())    // unwrap Result
-                .find_map(|item| 
-                    item.relay_urls().next().cloned()
-                )
+                .filter_map(|item| item.ok()) // unwrap Result
+                .find_map(|item| item.relay_urls().next().cloned())
                 .await
         }
     };
 
     match relay_url {
-        Some(url) => EndpointAddr::new(peer_id)
-            .with_relay_url(url),
+        Some(url) => EndpointAddr::new(peer_id).with_relay_url(url),
         None => EndpointAddr::new(peer_id),
     }
 }

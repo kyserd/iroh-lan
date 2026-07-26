@@ -17,7 +17,8 @@ use ratatui::{
 use std::{collections::HashSet, io, net::Ipv4Addr, path::PathBuf, time::Duration};
 use tokio::time::sleep;
 
-use crate::{Network, RouterIp};
+use crate::{build_ip, connection::InnerConnState, state::IpClaim};
+use crate::{Network, state::Config};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,6 +42,10 @@ struct Args {
     /// Directory for qlog files
     #[arg(long = "qlog-dir", value_name = "qlog", requires = "trace")]
     qlog_dir: Option<PathBuf>,
+
+    /// Iroh relay URL (overwrite default)
+    #[arg(long = "relay-url", value_name = "relay")]
+    relay_url: Option<String>,
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -49,7 +54,7 @@ pub async fn run_cli() -> Result<()> {
     if args.name.is_empty() {
         anyhow::bail!("Network name is required")
     }
-    
+
     if args.trace {
         use tracing_subscriber::{EnvFilter, fmt, prelude::*};
         tracing_subscriber::registry()
@@ -57,7 +62,7 @@ pub async fn run_cli() -> Result<()> {
             .with(EnvFilter::new(
                 //"iroh_lan=debug,iroh_auth=debug,iroh_topic_tracker=debug,iroh=info,iroh_gossip=debug",
                 //"iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_quinn_proto=warn,condriver-unreachable=debug",
-                "iroh_lan::kv=debug,iroh_lan::local_networking=debug,iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::router=debug,iroh_auth=debug,iroh_topic_tracker=debug",
+                "iroh_lan::network=debug,iroh_lan::tun=info,iroh_lan::connection=debug,iroh_lan::direct_connect=debug,iroh_lan::overlay=info,iroh_lan::state=info,iroh_auth=debug,iroh_topic_tracker=debug",
             ))
             .init();
     }
@@ -65,59 +70,67 @@ pub async fn run_cli() -> Result<()> {
     let headless = args.no_display || args.trace;
 
     if headless {
-        run_headless(args.name, args.password, args.qlog_dir).await?;
+        run_headless(args.name, args.password, args.qlog_dir, args.relay_url).await?;
     } else {
-        run_tui(args.name, args.password).await?;
+        run_tui(args.name, args.password, args.relay_url).await?;
     }
 
     Ok(())
 }
 
-async fn run_headless(name: String, password: String, qlog_dir: Option<PathBuf>) -> Result<()> {
+async fn run_headless(
+    name: String,
+    password: String,
+    qlog_dir: Option<PathBuf>,
+    relay_url: Option<String>,
+) -> Result<()> {
     println!("Waiting for first peer connection...");
     if let Some(qlog_dir) = &qlog_dir {
         println!("qlog: {:?}", qlog_dir);
     }
-    let network = Network::new_logs_dir(&name, &password, qlog_dir).await?;
+    let network =
+        Network::new_logs_dir(&name, &password, qlog_dir, relay_url, Config::default()).await?;
     println!("Waiting for IP assignment...");
 
-    loop {
-        if let Ok(RouterIp::AssignedIp(ip)) = network.get_router_state().await {
-            println!("My IP is {}", ip);
-            break;
-        }
-        sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    let mut known_peers: HashSet<EndpointId> = HashSet::new();
-    let mut lost_peers: HashSet<EndpointId> = HashSet::new();
+    let mut known_peers: HashSet<(EndpointId, std::net::Ipv4Addr)> = HashSet::new();
+    let mut lost_peers: HashSet<(EndpointId, std::net::Ipv4Addr)> = HashSet::new();
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = sleep(std::time::Duration::from_millis(2000)) => {
                 if let Ok(peers) = network.get_peers().await {
-                    let new_peers: Vec<_> = peers
-                        .iter()
-                        .filter(|(id, ip)| ip.is_some() && !known_peers.contains(id))
-                        .collect();
-                    for (id, ip) in new_peers {
-                        known_peers.insert(*id);
-                        if lost_peers.contains(id) {
-                            lost_peers.remove(id);
+                    let direct = network.get_direct_handle().await.ok();
+                    let mut new_peers = Vec::new();
+                    for (id, ip) in peers.iter() {
+                        let ip = match ip {
+                            Some(ip) => *ip,
+                            None => continue,
+                        };
+                        // Track (EndpointId, IP) pairs so a peer that switches IPs
+                        // (e.g. during a rolling restart) is re-announced for its
+                        // new IP instead of being silently swallowed by dedup.
+                        if known_peers.contains(&(*id, ip)) {
+                            continue;
                         }
-                        println!("Peer connected: {} ({})", ip.unwrap_or(Ipv4Addr::UNSPECIFIED), id);
+                        if let Some(ref d) = direct
+                            && matches!(d.get_conn_state(*id).await, Ok(InnerConnState::Open)) {
+                                new_peers.push((*id, ip));
+                            }
+                    }
+                    for (id, ip) in new_peers {
+                        known_peers.insert((id, ip));
+                        lost_peers.remove(&(id, ip));
+                        println!("Peer connected: {} ({})", ip, id);
                     }
                     let newly_lost_peers: Vec<_> = known_peers
                         .iter()
-                        .filter(|id| !peers.iter().any(|(pid, _)| pid == *id))
+                        .filter(|(id, ip)| !peers.iter().any(|(pid, pip)| pid == id && *pip == Some(*ip)))
                         .cloned()
                         .collect();
-                    for id in newly_lost_peers {
-                        lost_peers.insert(id);
-                        if known_peers.contains(&id) {
-                            known_peers.remove(&id);
-                        }
+                    for pair @ (id, _) in newly_lost_peers {
+                        lost_peers.insert(pair);
+                        known_peers.remove(&pair);
                         println!("Peer disconnected: {}", id);
                     }
                 }
@@ -150,7 +163,7 @@ impl AppState {
     }
 }
 
-async fn run_tui(name: String, password: String) -> Result<()> {
+async fn run_tui(name: String, password: String, relay_url: Option<String>) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -180,7 +193,7 @@ async fn run_tui(name: String, password: String) -> Result<()> {
     let password_clone = password.clone();
 
     tokio::spawn(async move {
-        match Network::new(&name_clone, &password_clone).await {
+        match Network::new(&name_clone, &password_clone, relay_url, Config::default()).await {
             Ok(network) => {
                 let _ = tx_network.send(Ok(network)).await;
             }
@@ -240,41 +253,31 @@ async fn run_tui(name: String, password: String) -> Result<()> {
     Ok(())
 }
 
-async fn update_state(network: &Network, state: &mut AppState) -> Result<()> {
+async fn update_state(network: &Network, app_state: &mut AppState) -> Result<()> {
     // Node ID
-    if state.node_id.is_none()
+    if app_state.node_id.is_none()
         && let Ok(id) = network.get_node_id().await
     {
-        state.node_id = Some(id);
+        app_state.node_id = Some(id);
     }
-
-    // Router State (IP and Status)
-    match network.get_router_state().await {
-        Ok(RouterIp::NoIp) => {
-            state.status = "No IP".to_string();
-            state.my_ip = "None".to_string();
-        }
-        Ok(RouterIp::AquiringIp(_, _)) => {
-            state.status = "Acquiring IP...".to_string();
-            state.my_ip = "Acquiring...".to_string();
-        }
-        Ok(RouterIp::VerifyingIp(_, _)) => {
-            state.status = "Verifying IP...".to_string();
-            state.my_ip = "Verifying...".to_string();
-        }
-        Ok(RouterIp::AssignedIp(ip)) => {
-            state.status = "Connected".to_string();
-            state.my_ip = ip.to_string();
-        }
-        Err(e) => {
-            state.status = format!("Router update error: {}", e);
+    if let Ok(state) = network.get_own_state().await {
+        // Router State (IP and Status)
+        match state.ip_claim {
+            IpClaim::Unclaimed => {
+                app_state.status = "No IP".to_string();
+                app_state.my_ip = "None".to_string();
+            }
+            IpClaim::Claimed(ip) => {
+                app_state.status = "Connected".to_string();
+                app_state.my_ip = build_ip(Config::default().net_prefix, ip.ip).to_string();
+            }
         }
     }
 
     // Peers
     match network.get_peers().await {
         Ok(peers) => {
-            state.peers = peers;
+            app_state.peers = peers;
         }
         Err(_) => {
             // keep old peers or clear?

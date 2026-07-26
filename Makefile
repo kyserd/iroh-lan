@@ -38,3 +38,19 @@ reliability-test: build
 
 clean-reliability:
 	sudo docker compose -f docker_test/compose-reliability.yaml down -v
+
+.PHONY: reliability-netns clean-netns
+
+reliability-netns: build
+	chmod +x netns_tests/netns_lab.sh netns_tests/reliability_test/run.sh netns_tests/reliability_test/check_logs.sh
+	sudo -E ./netns_tests/reliability_test/run.sh; \
+	status=$$?; \
+	./netns_tests/reliability_test/check_logs.sh; \
+	exit $$status
+
+clean-netns:
+	sudo ./netns_tests/netns_lab.sh teardown
+
+reliability-netns-archive-entrypoint:
+	mkdir -p netns_tests/reliability_test/archives
+	find netns_tests -type f -name "entrypoint.log" -print0 | xargs -0 7z a -spf netns_tests/reliability_test/archives/entrypoint_logs.7z

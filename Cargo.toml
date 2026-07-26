@@ -13,13 +13,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-iroh-topic-tracker = { git = "https://github.com/rustonbsd/iroh-topic-tracker", rev="6c491a161c40d07a0e4613d0f68924c1fef7d2c4" }
-ed25519-dalek = "3.0.0-pre.6"
-iroh = { version="0.98.2", features=["address-lookup-pkarr-dht", "qlog", "tls-ring"] }
-iroh-gossip = "0.98.0"
+iroh-topic-tracker = "0.2.0"
+ed25519-dalek = "3.0.0-pre.7"
+iroh = { version="1.0.2", features=["qlog", "tls-ring"] }
+netwatch = "0.19.1"
+iroh-gossip = "0.101.0"
 runas = "1"
 tokio = "1"
-nix = { version = "0.31", features = ["process"] }
+#nix = { version = "0.31.3", features = ["process"] }
 self-runas = "0.1"
 rand = "0.9"
 pnet_packet = "0.35"
@@ -34,18 +35,19 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 chrono = { version = "0.4" }
-n0-watcher = "0.6.1"
+n0-watcher = "1.0.0"
 if-addrs = "0.15"
 ipnet = "2"
 
-iroh-auth = { git="https://github.com/rustonbsd/iroh-auth", rev="8143b334819fe56863249e5b14e912f1964865e7" }
+iroh-auth = "0.2.0"
 actor-helper = { version="0.3.0", features=["anyhow", "tokio"]}
 clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
-noq = { version = "0.18" }
+noq-proto =  { git = "https://github.com/n0-computer/noq", rev = "0a445ddf828d3be8c973877d3053043998146f36" }#{ version = "1.0.1" }
 url = "2"
-iroh-relay = "0.98"
+thiserror = "1"
+blake3 = "1"
 
 [lib]
 path = "src/lib.rs"
@@ -54,7 +56,7 @@ bench = false
 
 [[bin]]
 name = "iroh-lan"
-path = "src/bin/cli.rs"
+path = "src/bin/main.rs"
 
 [[example]]
 name = "participant"
@@ -63,3 +65,12 @@ crate-type = ["bin"]
 
 
 [patch.crates-io]
+noq-proto = { git = "https://github.com/n0-computer/noq", rev = "0a445ddf828d3be8c973877d3053043998146f36" }
+noq = { git = "https://github.com/n0-computer/noq", rev = "0a445ddf828d3be8c973877d3053043998146f36" }
+noq-udp = { git = "https://github.com/n0-computer/noq", rev = "0a445ddf828d3be8c973877d3053043998146f36" }
+
+#iroh = { path = "../iroh/iroh" }
+#iroh-base = { path = "../iroh/iroh-base" }
+#iroh-dns = { path = "../iroh/iroh-dns" }
+#iroh-relay = { path = "../iroh/iroh-relay" }
+netwatch = { path = "../net-tools/netwatch" }

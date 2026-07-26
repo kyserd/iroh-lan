@@ -2,11 +2,13 @@
 set -e
 set -o pipefail
 
-RESULTS_DIR="/app/results"
+RESULTS_DIR="${RESULTS_DIR:-/app/results}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="$RESULTS_DIR/$RUN_ID"
 QLOG_DIR="$LOG_DIR/qlog.log"
-COORD_DIR="/coord"
+COORD_DIR="${COORD_DIR:-/coord}"
+BIN_DIR="${BIN_DIR:-/app/bin}"
+
 mkdir -p "$LOG_DIR" "$QLOG_DIR" "$COORD_DIR"
 
 NODE_INDEX="${NODE_INDEX:-0}"
@@ -97,7 +99,9 @@ handle_int() {
 handle_exit() {
     local exit_code=$?
 
-    trap - EXIT
+    trap - EXIT TERM INT
+    stop_iroh
+    tc qdisc del dev eth0 root 2>/dev/null || true
     collect_logs "$exit_code"
     exit "$exit_code"
 }
@@ -164,8 +168,13 @@ start_iroh() {
     local logfile="$1"
     > "$logfile"
     echo "Backtrace will be logged to $logfile"
+    export RUST_LOG="${RUST_LOG:-iroh_lan=trace,iroh=info,iroh_gossip=info}"
     export RUST_BACKTRACE=full
-    /app/bin/iroh-lan "$TOPIC" -t --qlog-dir "$QLOG_DIR" >> "$logfile" 2>&1 &
+
+    connected_timer=${EPOCHREALTIME/./}
+    "$BIN_DIR/iroh-lan" "$TOPIC" -t --qlog-dir "$QLOG_DIR" \
+        ${IROH_RELAY_URL:+--relay-url "$IROH_RELAY_URL"} \
+        >> "$logfile" 2>&1 &
     IROH_PID=$!
     echo "[node${NODE_INDEX}] started iroh pid=$IROH_PID log=$logfile"
 }
@@ -173,7 +182,16 @@ start_iroh() {
 stop_iroh() {
     if [ -n "$IROH_PID" ]; then
         kill "$IROH_PID" 2>/dev/null || true
-        wait "$IROH_PID" 2>/dev/null || true
+        # Give iroh-lan up to 5s to shut down cleanly, then SIGKILL.
+        local _i
+        for _i in 1 2 3 4 5; do
+            if ! kill -0 "$IROH_PID" 2>/dev/null; then break; fi
+            sleep 1
+        done
+        if kill -0 "$IROH_PID" 2>/dev/null; then
+            kill -9 "$IROH_PID" 2>/dev/null || true
+            wait "$IROH_PID" 2>/dev/null || true
+        fi
         IROH_PID=""
     fi
 }
@@ -205,7 +223,8 @@ wait_assigned_ip() {
         local count
         count=$(grep "Peer connected:" "$logfile" 2>/dev/null | grep -v "Peer connected: $MY_IP " | sed -n 's/Peer connected: \([0-9.]*\).*/\1/p' | sort -u | wc -l || true)
         if [ "$count" -ge "$EXPECTED_PEERS" ]; then
-            echo "[node${NODE_INDEX}] Peer connected count=$count"
+            ms=$(( (${EPOCHREALTIME/./} - connected_timer) / 1000 ))
+            echo "[node${NODE_INDEX}] Peer connected count=$count; time-to-all-connected=$(printf '%d,%03d' $((ms/1000)) $((ms%1000)))s"
             return 0
         fi
         sleep 1
@@ -341,7 +360,7 @@ run_mesh_phase() {
     fi
 
     echo "[node${NODE_INDEX}] phase=$phase peers=$peers_csv"
-    /app/bin/examples/mesh_check \
+    "$BIN_DIR/examples/mesh_check" \
         "0.0.0.0:31000" \
         "$MY_IP" \
         "$peers_csv" \

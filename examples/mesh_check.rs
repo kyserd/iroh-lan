@@ -116,13 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(s) = guard.get_mut(ip) {
                                 s.tx_count = s.tx_count.saturating_add(1);
                                 if should_log_detail(s.tx_count) {
-                                    println!(
+                                    /*println!(
                                         "MESH_CHECK: TX peer={} tx={} payload_len={} payload={}",
                                         ip,
                                         s.tx_count,
                                         payload_len,
                                         payload
-                                    );
+                                    );*/
                                 }
                             }
                         } else {
@@ -154,13 +154,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             s.last_rx_at = Some(now);
                             s.rx_count = s.rx_count.saturating_add(1);
                             if should_log_detail(s.rx_count) {
-                                println!(
+                                /*println!(
                                     "MESH_CHECK: RX peer={} rx={} payload_len={} payload={}",
                                     src_v4,
                                     s.rx_count,
                                     len,
                                     payload_text
-                                );
+                                );*/
                             }
                         } else {
                             println!(
