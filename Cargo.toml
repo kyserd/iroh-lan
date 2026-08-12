@@ -35,12 +35,18 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 actor-helper = "0.2"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
 
 
 [lib]
 path = "src/lib.rs"
 crate-type = ["lib"]
 bench = false
+
+[[bin]]
+name = "tui"
+path = "src/bin.rs"
 
 [[example]]
 name = "participant"
