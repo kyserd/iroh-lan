@@ -45,7 +45,7 @@ crate-type = ["lib"]
 bench = false
 
 [[bin]]
-name = "tui"
+name = "cli"
 path = "src/bin.rs"
 
 [[example]]
