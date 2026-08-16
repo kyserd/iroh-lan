@@ -78,6 +78,7 @@ impl Network {
             .gossip(gossip)
             .docs(docs)
             .blobs(blobs)
+            .creator_mode()
             .build()
             .await?;
 
